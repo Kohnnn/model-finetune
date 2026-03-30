@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+.agent/
+unsloth_compiled_cache/
+
+# Local data and generated artifacts
+raw_dataset/
+ocr_pipeline/chroma_chunks.jsonl
+ocr_pipeline/finetune_template.jsonl
+ocr_pipeline/parse_failures.log
+finetune/outputs/
+
+# Deployment secrets and runtime state
+deployment/.env
+deployment/models/*
+!deployment/models/.gitkeep
+deployment/certs/*
+!deployment/certs/.gitkeep
+deployment/chroma_data/*
+!deployment/chroma_data/.gitkeep
+deployment/model_cache/*
+!deployment/model_cache/.gitkeep
+
+# Misc
+trace_dill.txt
+trace_ds.txt
