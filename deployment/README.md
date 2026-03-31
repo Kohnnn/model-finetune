@@ -94,6 +94,12 @@ Start the app:
 docker compose -f deployment/docker-compose.yml --env-file deployment/.env up -d app
 ```
 
+Run the benchmark script against the live `/query` endpoint:
+
+```bash
+python deployment/evaluate_live_query.py --output-path deployment/benchmarks/latest_report.md
+```
+
 Start nginx later if needed:
 
 ```bash

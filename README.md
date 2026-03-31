@@ -8,186 +8,88 @@ Private AI analyst stack for local financial research workflows.
 - fine-tune `unsloth/Qwen3.5-4B` on the cleaned corpus
 - export a deployment-ready GGUF and publish a private Hugging Face model
 
-The repository now contains a full end-to-end working path from `raw_dataset/` to:
+Key links:
 
-- a private Hugging Face model: `Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
-- model URL: `https://huggingface.co/Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
-- a deployment-ready GGUF: `finetune/outputs/qwen35_4b_full_corpus_draft23974/gguf/qwen3_5_4b_private_analyst_full_corpus_q4_k_m_gguf/Qwen3.5-4B.Q4_K_M.gguf`
+- GitHub code: `https://github.com/Kohnnn/finetune`
+- GitHub model mirror: `https://github.com/Kohnnn/model-finetune`
+- Hugging Face model: `https://huggingface.co/Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
 
-## What This Repo Does
+## Snapshot
 
-1. parses `.pdf`, `.docx`, and `.pptx` research files from `raw_dataset/`
-2. removes most disclaimer and contact boilerplate before chunking
-3. writes clean retrieval and SFT template datasets in `ocr_pipeline/`
-4. ingests the retrieval corpus into ChromaDB
-5. serves a private analyst-style RAG API through FastAPI and llama.cpp
-6. fine-tunes `unsloth/Qwen3.5-4B` on the cleaned corpus and exports both merged HF and GGUF artifacts
+- parse result: `8179/8180` supported files processed
+- cleaned chunks: `23978`
+- full-corpus training rows: `23974`
+- final train loss: `1.0765`
+- final model folder: `finetune/outputs/qwen35_4b_full_corpus_draft23974`
+- deployment model: `deployment/models/Qwen3.5-4B.Q4_K_M.gguf`
 
-## Current Status
-
-- `ocr_pipeline/` is implemented and now strips most disclaimer/contact boilerplate before chunking
-- latest full parse processed `8179/8180` supported files and produced `23978` cleaned chunks
-- `deployment/` contains a working RAG-first app, ingestion flow, Docker packaging, and bootstrap script
-- `finetune/` contains a validated Windows GPU training path for `unsloth/Qwen3.5-4B`
-- the local RTX `4060 Ti 16GB` CUDA environment is validated and completed a full LoRA run
-- final full-run artifact: `finetune/outputs/qwen35_4b_full_corpus_draft23974`
-- final private Hugging Face repo: `Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
-- final private Hugging Face URL: `https://huggingface.co/Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
-- final deployment GGUF: `finetune/outputs/qwen35_4b_full_corpus_draft23974/gguf/qwen3_5_4b_private_analyst_full_corpus_q4_k_m_gguf/Qwen3.5-4B.Q4_K_M.gguf`
-
-## System Architecture
+## Architecture
 
 ```text
-                              +---------------------------+
-                              |       raw_dataset/        |
-                              |  PDFs / DOCX / PPTX       |
-                              +-------------+-------------+
-                                            |
-                                            v
-                              +---------------------------+
-                              | ocr_pipeline/process_pdfs |
-                              | - extract text            |
-                              | - remove boilerplate      |
-                              | - chunk documents         |
-                              +------+------+-------------+
-                                     |      |
-                  +------------------+      +-------------------+
-                  |                                         |
-                  v                                         v
-    +-------------------------------+        +--------------------------------+
-    | ocr_pipeline/chroma_chunks    |        | ocr_pipeline/finetune_template |
-    | JSONL retrieval corpus        |        | JSONL chat templates           |
-    +---------------+---------------+        +----------------+---------------+
-                    |                                         |
-                    v                                         v
-    +-------------------------------+        +--------------------------------+
-    | deployment/app/ingest.py      |        | finetune/prepare_seed_dataset  |
-    | embed + upsert into ChromaDB  |        | build draft SFT rows           |
-    +---------------+---------------+        +----------------+---------------+
-                    |                                         |
-                    v                                         v
-    +-------------------------------+        +--------------------------------+
-    |        ChromaDB collection    |        | qwen35_full_corpus_draft.jsonl |
-    |     research_chunks_v1        |        | cleaned full-corpus SFT set    |
-    +---------------+---------------+        +----------------+---------------+
-                    |                                         |
-                    |                                         v
-                    |                         +--------------------------------+
-                    |                         |      finetune/train.py          |
-                    |                         |  Unsloth + LoRA on Qwen 3.5    |
-                    |                         +----------------+---------------+
-                    |                                         |
-                    |                     +-------------------+-------------------+
-                    |                     |                                       |
-                    |                     v                                       v
-                    |    +--------------------------------+     +--------------------------------------+
-                    |    | merged_model/                  |     | gguf/Qwen3.5-4B.Q4_K_M.gguf         |
-                    |    | private HF upload              |     | deployment-ready llama.cpp artifact  |
-                    |    +--------------------------------+     +--------------------------------------+
-                    |
-                    v
-    +-------------------------------+        +--------------------------------+
-    | deployment/app/main.py        | -----> | llama.cpp server               |
-    | FastAPI RAG orchestration     |        | local OpenAI-compatible API    |
-    +---------------+---------------+        +----------------+---------------+
-                    ^                                         |
-                    |                                         v
-    +-------------------------------+        +--------------------------------+
-    | end users / analyst prompts   | <----- | grounded answer + citations    |
-    +-------------------------------+        +--------------------------------+
++------------------+      +---------------------------+      +----------------------+
+|   raw_dataset/   | ---> | ocr_pipeline/process_pdfs | ---> | chroma_chunks.jsonl  |
+| PDF / DOCX / PPTX|      | extract + clean + chunk   |      | finetune_template    |
++------------------+      +---------------------------+      +----------+-----------+
+                                                                       / \
+                                                                      /   \
+                                                                     v     v
+                                                     +------------------+   +---------------------------+
+                                                     | deployment ingest|   | prepare_seed_dataset.py   |
+                                                     | embed -> Chroma  |   | build draft SFT dataset   |
+                                                     +--------+---------+   +-------------+-------------+
+                                                              |                           |
+                                                              v                           v
+                                                     +------------------+      +-------------------------+
+                                                     | ChromaDB         |      | qwen35_full_corpus     |
+                                                     | research_chunks  |      | _draft.jsonl           |
+                                                     +--------+---------+      +------------+------------+
+                                                              |                             |
+                                                              |                             v
+                                                              |                +--------------------------+
+                                                              |                | finetune/train.py        |
+                                                              |                | Unsloth LoRA on Qwen 3.5 |
+                                                              |                +-------------+------------+
+                                                              |                              |
+                                                              |                   +----------+----------+
+                                                              |                   |                     |
+                                                              |                   v                     v
+                                                              |        +-------------------+   +----------------------+
+                                                              |        | merged_model/     |   | gguf/ Q4_K_M export  |
+                                                              |        | private HF upload |   | + mmproj companion   |
+                                                              |        +-------------------+   +----------+-----------+
+                                                              |                                         |
+                                                              +------------------------------+          |
+                                                                                             |          v
++------------------+      +----------------------+      +------------------+      +--------------> +------------------+
+| analyst prompts  | ---> | deployment/app/main | ---> | llama.cpp server | ---> | grounded API   | | deployment/      |
++------------------+      | FastAPI orchestration|      | OpenAI-style     |      | /query         | | models/         |
+                          +----------------------+      +------------------+      +----------------+ +------------------+
 ```
 
 ## Data Flow
 
 ```text
-[1] Private documents
-    raw_dataset/
-        |
-        v
-[2] Parse + cleanup
-    ocr_pipeline/process_pdfs.py
-        |
-        +--> chroma_chunks.jsonl
-        |       |
-        |       v
-        |   deployment/app/ingest.py
-        |       |
-        |       v
-        |   ChromaDB
-        |
-        +--> finetune_template.jsonl
-                |
-                v
-            finetune/prepare_seed_dataset.py
-                |
-                v
-            qwen35_full_corpus_draft.jsonl
-                |
-                v
-            finetune/train.py
-                |
-                +--> adapter/
-                +--> merged_model/
-                +--> training_summary.json
-                +--> gguf/
-                        |
-                        v
-                deployment/models/
-                        |
-                        v
-                deployment/docker-compose.yml
-                        |
-                        v
-                local private analyst service
+raw_dataset/
+  -> ocr_pipeline/process_pdfs.py
+     -> ocr_pipeline/chroma_chunks.jsonl
+        -> deployment/app/ingest.py
+           -> ChromaDB collection: research_chunks_v1
+     -> ocr_pipeline/finetune_template.jsonl
+        -> finetune/prepare_seed_dataset.py
+           -> finetune/outputs/datasets/qwen35_full_corpus_draft.jsonl
+              -> finetune/train.py
+                 -> adapter/
+                 -> merged_model/
+                 -> training_summary.json
+                 -> gguf/
+                    -> deployment/models/
+                       -> deployment/docker-compose.yml
+                          -> live analyst service
 ```
 
-## Repository Layout
+## How To Run
 
-```text
-deployment/         Docker, app API, ingestion, bootstrap, nginx, env template
-finetune/           Qwen 3.5 training pipeline, export helpers, training notes
-ocr_pipeline/       local parsing and chunk generation pipeline
-raw_dataset/        private source documents (gitignored)
-tests/              focused regression tests for parser and training helpers
-DEVELOPMENT_JOURNAL.md
-FINE_TUNING_GUIDE.md
-IMPLEMENTATION_NOTES.md
-README.md
-```
-
-## Key Outputs
-
-### Clean parse outputs
-
-- retrieval corpus: `ocr_pipeline/chroma_chunks.jsonl`
-- chat template corpus: `ocr_pipeline/finetune_template.jsonl`
-- parse failures: `ocr_pipeline/parse_failures.log`
-
-### Fine-tune outputs
-
-- full-corpus draft dataset: `finetune/outputs/datasets/qwen35_full_corpus_draft.jsonl`
-- adapter: `finetune/outputs/qwen35_4b_full_corpus_draft23974/adapter`
-- merged HF model: `finetune/outputs/qwen35_4b_full_corpus_draft23974/merged_model`
-- training summary: `finetune/outputs/qwen35_4b_full_corpus_draft23974/training_summary.json`
-
-### GGUF outputs
-
-- quantized model: `finetune/outputs/qwen35_4b_full_corpus_draft23974/gguf/qwen3_5_4b_private_analyst_full_corpus_q4_k_m_gguf/Qwen3.5-4B.Q4_K_M.gguf`
-- companion mmproj: `finetune/outputs/qwen35_4b_full_corpus_draft23974/gguf/qwen3_5_4b_private_analyst_full_corpus_q4_k_m_gguf/Qwen3.5-4B.BF16-mmproj.gguf`
-
-### Published artifact
-
-- private HF repo: `Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
-
-## Quick Start
-
-### 1. Install parser dependencies
-
-```bash
-python -m pip install -r ocr_pipeline/requirements.txt
-```
-
-### 2. Generate retrieval + SFT template data
+### 1. Parse documents
 
 ```bash
 python ocr_pipeline/process_pdfs.py \
@@ -196,46 +98,85 @@ python ocr_pipeline/process_pdfs.py \
   --extensions .pdf .docx .pptx
 ```
 
-### 3. Prepare deployment settings
+### 2. Run the merged Hugging Face model with `transformers`
 
-Windows PowerShell:
+```python
+from transformers import AutoModelForCausalLM, AutoProcessor
 
-```powershell
-Copy-Item deployment/.env.example deployment/.env
+model_id = "Mikkkkoooo/qwen35-4b-private-analyst-full-corpus"
+processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
+
+messages = [
+    {"role": "user", "content": "Summarize the key margin risks for a consumer lender."}
+]
+
+prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+inputs = processor(text=prompt, return_tensors="pt")
+outputs = model.generate(**inputs, max_new_tokens=256)
+print(processor.decode(outputs[0], skip_special_tokens=True))
 ```
 
-macOS/Linux/Git Bash:
+### 3. Run the GGUF with `llama.cpp`
 
 ```bash
-cp deployment/.env.example deployment/.env
+llama-cli \
+  -m finetune/outputs/qwen35_4b_full_corpus_draft23974/gguf/qwen3_5_4b_private_analyst_full_corpus_q4_k_m_gguf/Qwen3.5-4B.Q4_K_M.gguf \
+  --mmproj finetune/outputs/qwen35_4b_full_corpus_draft23974/gguf/qwen3_5_4b_private_analyst_full_corpus_q4_k_m_gguf/Qwen3.5-4B.BF16-mmproj.gguf \
+  -cnv \
+  -p "Summarize the key margin risks for a consumer lender."
 ```
 
-### 4. Wire the current full-corpus deployment model
+### 4. Run in Ollama
 
-Deployment is now wired to:
+This path is for local experimentation. Keep the model private.
 
-- `deployment/models/Qwen3.5-4B.Q4_K_M.gguf`
-- `deployment/models/Qwen3.5-4B.BF16-mmproj.gguf`
+1. Put these two files in the same folder:
+   - `Qwen3.5-4B.Q4_K_M.gguf`
+   - `Qwen3.5-4B.BF16-mmproj.gguf`
+2. Create a `Modelfile`:
 
-These are copied from:
+```text
+FROM ./Qwen3.5-4B.Q4_K_M.gguf
+TEMPLATE "{{ .Prompt }}"
+PARAMETER num_ctx 4096
+SYSTEM You are a private financial research analyst. Answer concisely and stay grounded in provided evidence.
+```
 
-- `finetune/outputs/qwen35_4b_full_corpus_draft23974/gguf/qwen3_5_4b_private_analyst_full_corpus_q4_k_m_gguf`
+3. Build and run:
 
-### 5. Bootstrap the local RAG stack
+```bash
+ollama create private-analyst-qwen35 -f Modelfile
+ollama run private-analyst-qwen35 "Summarize the key margin risks for a consumer lender."
+```
+
+If your Ollama build does not handle the Qwen 3.5 companion projection file cleanly, use the `llama.cpp` path above instead. The `llama.cpp` path is the validated one in this repo.
+
+### 5. Run the full private analyst service
+
+Prepare `deployment/.env` from `deployment/.env.example`, then run:
 
 ```bash
 python deployment/bootstrap_local.py
 ```
 
-For a quick ingest-only smoke start first:
+Query it:
 
 ```bash
-python deployment/bootstrap_local.py --ingest-limit 1024
+curl -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What are the key margin risks for ACB?"}'
+```
+
+### 6. Run a small live benchmark against `/query`
+
+```bash
+python deployment/evaluate_live_query.py --output-path deployment/benchmarks/latest_report.md
 ```
 
 ## Fine-Tuning Workflow
 
-### GPU environment setup
+### GPU environment
 
 ```powershell
 ./finetune/setup_gpu_env.ps1
@@ -251,7 +192,7 @@ python finetune/prepare_seed_dataset.py \
   --max-context-words 450
 ```
 
-### Run the full-corpus Qwen 3.5 fine-tune
+### Train the full-corpus Qwen 3.5 model
 
 ```bash
 python finetune/train.py \
@@ -279,82 +220,17 @@ python finetune/export_gguf.py \
   --gguf-name qwen3_5_4b_private_analyst_full_corpus_q4_k_m
 ```
 
-### Push merged model to Hugging Face
+## Release Checklist
 
-```bash
-python finetune/push_to_huggingface.py \
-  --model-dir finetune/outputs/qwen35_4b_full_corpus_draft23974/merged_model \
-  --repo-id Mikkkkoooo/qwen35-4b-private-analyst-full-corpus \
-  --private
-```
-
-## Deployment Model Wiring
-
-The deployment path expects these local environment values:
-
-- `LLAMA_MODEL_FILENAME=Qwen3.5-4B.Q4_K_M.gguf`
-- `LLAMA_MMPROJ_FILENAME=Qwen3.5-4B.BF16-mmproj.gguf`
-- `LLM_MODEL_NAME=qwen3.5-private-analyst`
-
-The compose stack passes both files into llama.cpp so the current export can be served directly.
-
-## How To Run The Models
-
-### Run the merged Hugging Face model with `transformers`
-
-```python
-from transformers import AutoModelForCausalLM, AutoProcessor
-
-model_id = "Mikkkkoooo/qwen35-4b-private-analyst-full-corpus"
-processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
-
-messages = [
-    {"role": "user", "content": "Summarize the key margin risks for a consumer lender."}
-]
-
-prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-inputs = processor(text=prompt, return_tensors="pt")
-outputs = model.generate(**inputs, max_new_tokens=256)
-print(processor.decode(outputs[0], skip_special_tokens=True))
-```
-
-### Run the GGUF locally with `llama.cpp`
-
-```bash
-llama-cli \
-  -m finetune/outputs/qwen35_4b_full_corpus_draft23974/gguf/qwen3_5_4b_private_analyst_full_corpus_q4_k_m_gguf/Qwen3.5-4B.Q4_K_M.gguf \
-  --mmproj finetune/outputs/qwen35_4b_full_corpus_draft23974/gguf/qwen3_5_4b_private_analyst_full_corpus_q4_k_m_gguf/Qwen3.5-4B.BF16-mmproj.gguf \
-  -cnv \
-  -p "Summarize the key margin risks for a consumer lender."
-```
-
-### Run the full private analyst service
-
-```bash
-python deployment/bootstrap_local.py
-```
-
-Then query it:
-
-```bash
-curl -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{"query": "What are the key margin risks for ACB?"}'
-```
-
-## Training Metrics
-
-Final full-corpus training summary:
-
-- base model: `unsloth/Qwen3.5-4B`
-- train rows: `23974`
-- epochs: `1.0`
-- runtime: `68249.53s` (~`18.96h`)
-- train loss: `1.0765`
-- adapter size: about `0.10 GB`
-- merged model size: about `8.70 GB`
-- GGUF directory size: about `3.15 GB`
+- rerun parse and review `ocr_pipeline/parse_failures.log`
+- regenerate the SFT dataset
+- train and save `training_summary.json`
+- export merged HF and GGUF artifacts
+- copy new `.gguf` and `mmproj` into `deployment/models/`
+- run `python deployment/bootstrap_local.py --ingest-limit 1024`
+- verify `/healthz`, `/query`, and `deployment/evaluate_live_query.py`
+- update README, journal, release notes, and model card
+- push GitHub commits and upload the HF model
 
 ## Roadmap
 
@@ -362,118 +238,42 @@ Final full-corpus training summary:
 
 - replace draft-generated completions with a curated human-reviewed SFT set
 - add a held-out evaluation pack of analyst questions and golden answers
-- compare one-epoch full-corpus training against a smaller higher-quality reviewed subset
-- test response-only masking again when the Windows Qwen 3.5 stack stabilizes
+- compare full-corpus training against a smaller higher-quality reviewed subset
+- retry response-only masking once the Windows Qwen 3.5 path is more stable
 
 ### Retrieval quality
 
 - tune chunking and overlap per document type
 - add metadata-aware retrieval filters by company, sector, and year
-- benchmark multilingual embedding choices on your actual analyst queries
+- benchmark embedding choices against your actual analyst questions
 
 ### Deployment
 
 - benchmark the new Qwen 3.5 GGUF in the live RAG app
-- add prompt/version tracing and response evaluation logging
-- add an optional production profile for HTTPS and remote access
+- reduce fallback-only answers through better serving prompts and evaluation loops
+- add a production profile for HTTPS and remote access
 
 ### Ops and publishing
 
-- add a release checklist for future model refreshes
-- tag model versions consistently across GitHub, GGUF, and Hugging Face
-- add automated smoke tests for parse, ingest, query, and export flows
+- tag future model versions consistently across GitHub, GGUF, and Hugging Face
+- automate smoke tests for parse, ingest, query, train, and export flows
+- keep all private corpora and generated datasets out of public distribution
 
-## Release Checklist
+## Docs
 
-Use this checklist whenever you cut a new model version.
-
-### Data
-
-- rerun `ocr_pipeline/process_pdfs.py` on the intended source set
-- review `ocr_pipeline/parse_failures.log`
-- confirm disclaimer/contact filtering still looks clean on spot checks
-- regenerate the draft or reviewed SFT dataset
-
-### Training
-
-- record the exact base model and hyperparameters
-- save `training_summary.json`
-- smoke-test a few prompts locally before publishing
-- export both merged HF and GGUF artifacts
-
-### Deployment
-
-- copy the new `.gguf` and `mmproj` files into `deployment/models/`
-- update `deployment/.env` if filenames changed
-- run `python deployment/bootstrap_local.py --ingest-limit 1024` if you want a quick smoke boot
-- verify `/healthz` and one `/query` response
-
-### Publishing
-
-- update `README.md`, `DEVELOPMENT_JOURNAL.md`, and `finetune/QWEN35_TRAINING_NOTES.md`
-- update the Hugging Face model card usage section and roadmap
-- push GitHub commits
-- upload the merged model to the intended Hugging Face repo
-
-## Sharing Policy
-
-### Safe to share
-
-- source code and docs in this repo
-- training commands, hyperparameters, and troubleshooting notes
-- private Hugging Face repo links shared only with approved collaborators
-
-### Keep private
-
-- `raw_dataset/`
-- generated JSONL corpora under `ocr_pipeline/` and `finetune/outputs/datasets/`
-- local deployment secrets in `deployment/.env`
-- local model binaries under `deployment/models/` unless explicitly approved
-
-### Before making anything public
-
-- confirm data rights for the underlying documents
-- verify no proprietary text is embedded in any public dataset release
-- review the model card for private-data references and intended visibility
-
-## Documentation Map
-
-- `DEVELOPMENT_JOURNAL.md` - chronological engineering journal for the whole stack
-- `deployment/README.md` - deployment, env wiring, and bootstrap workflow
-- `deployment/app/README.md` - app service internals and file map
+- `DEVELOPMENT_JOURNAL.md` - chronological engineering journal
+- `RELEASE_NOTES.md` - milestone summary
+- `deployment/README.md` - deployment and bootstrap workflow
+- `deployment/app/README.md` - app internals
 - `ocr_pipeline/README.md` - parser details and output schema
 - `finetune/README.md` - training workflow and artifact layout
-- `finetune/QWEN35_TRAINING_NOTES.md` - detailed Qwen 3.5 troubleshooting and run notes
-- `FINE_TUNING_GUIDE.md` - higher-level fine-tuning and deployment guide
+- `finetune/QWEN35_TRAINING_NOTES.md` - detailed Qwen 3.5 troubleshooting log
+- `FINE_TUNING_GUIDE.md` - higher-level fine-tuning guide
 
-## Validation Already Run
-
-- `python -m compileall deployment/app deployment/bootstrap_local.py ocr_pipeline/process_pdfs.py tests`
-- `pytest tests/test_process_pdfs.py tests/test_train.py tests/test_rag.py -q`
-- `docker compose -f deployment/docker-compose.yml --env-file deployment/.env config`
-- full-corpus fine-tune completed successfully
-- merged model uploaded to private Hugging Face repo
-- GGUF export completed successfully
-
-## Publishing Notes
+## Privacy Notes
 
 - `raw_dataset/` is private and gitignored
 - generated JSONL datasets are gitignored
-- model artifacts are gitignored locally
-- `deployment/.env` is local-only and not committed
-- the Hugging Face repo is private because the underlying corpus is private
-
-## Commit Readiness
-
-The repository is now initialized with git and cleaned for an initial source commit.
-
-Ignored local-only state includes:
-
-- `.venv/`
-- `.agent/`
-- `raw_dataset/`
-- `finetune/outputs/`
-- `ocr_pipeline/chroma_chunks.jsonl`
-- `ocr_pipeline/finetune_template.jsonl`
-- `deployment/.env`
-- deployment runtime caches and local model files
+- local model binaries are gitignored
+- `deployment/.env` is local-only
+- the Hugging Face model repo is private because the source corpus is private

@@ -29,6 +29,7 @@ deployment/chroma_data/*
 !deployment/chroma_data/.gitkeep
 deployment/model_cache/*
 !deployment/model_cache/.gitkeep
+deployment/benchmarks/latest_report.md
 
 # Misc
 trace_dill.txt

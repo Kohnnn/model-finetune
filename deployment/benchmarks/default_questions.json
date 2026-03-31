@@ -1,0 +1,17 @@
+[
+  {
+    "id": "acb_margin_risks",
+    "question": "What are the key margin risks for ACB?",
+    "expected_keywords": ["margin", "CIR", "credit", "risk"]
+  },
+  {
+    "id": "acb_asset_quality",
+    "question": "How does the corpus describe ACB asset quality?",
+    "expected_keywords": ["asset", "quality", "NPL", "loan"]
+  },
+  {
+    "id": "acb_target_price",
+    "question": "What target price or recommendation changes are mentioned for ACB?",
+    "expected_keywords": ["target", "price", "recommendation", "upgrade"]
+  }
+]
