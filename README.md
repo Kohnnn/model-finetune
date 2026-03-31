@@ -298,6 +298,51 @@ The deployment path expects these local environment values:
 
 The compose stack passes both files into llama.cpp so the current export can be served directly.
 
+## How To Run The Models
+
+### Run the merged Hugging Face model with `transformers`
+
+```python
+from transformers import AutoModelForCausalLM, AutoProcessor
+
+model_id = "Mikkkkoooo/qwen35-4b-private-analyst-full-corpus"
+processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
+
+messages = [
+    {"role": "user", "content": "Summarize the key margin risks for a consumer lender."}
+]
+
+prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+inputs = processor(text=prompt, return_tensors="pt")
+outputs = model.generate(**inputs, max_new_tokens=256)
+print(processor.decode(outputs[0], skip_special_tokens=True))
+```
+
+### Run the GGUF locally with `llama.cpp`
+
+```bash
+llama-cli \
+  -m finetune/outputs/qwen35_4b_full_corpus_draft23974/gguf/qwen3_5_4b_private_analyst_full_corpus_q4_k_m_gguf/Qwen3.5-4B.Q4_K_M.gguf \
+  --mmproj finetune/outputs/qwen35_4b_full_corpus_draft23974/gguf/qwen3_5_4b_private_analyst_full_corpus_q4_k_m_gguf/Qwen3.5-4B.BF16-mmproj.gguf \
+  -cnv \
+  -p "Summarize the key margin risks for a consumer lender."
+```
+
+### Run the full private analyst service
+
+```bash
+python deployment/bootstrap_local.py
+```
+
+Then query it:
+
+```bash
+curl -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What are the key margin risks for ACB?"}'
+```
+
 ## Training Metrics
 
 Final full-corpus training summary:
@@ -310,6 +355,33 @@ Final full-corpus training summary:
 - adapter size: about `0.10 GB`
 - merged model size: about `8.70 GB`
 - GGUF directory size: about `3.15 GB`
+
+## Roadmap
+
+### Model quality
+
+- replace draft-generated completions with a curated human-reviewed SFT set
+- add a held-out evaluation pack of analyst questions and golden answers
+- compare one-epoch full-corpus training against a smaller higher-quality reviewed subset
+- test response-only masking again when the Windows Qwen 3.5 stack stabilizes
+
+### Retrieval quality
+
+- tune chunking and overlap per document type
+- add metadata-aware retrieval filters by company, sector, and year
+- benchmark multilingual embedding choices on your actual analyst queries
+
+### Deployment
+
+- benchmark the new Qwen 3.5 GGUF in the live RAG app
+- add prompt/version tracing and response evaluation logging
+- add an optional production profile for HTTPS and remote access
+
+### Ops and publishing
+
+- add a release checklist for future model refreshes
+- tag model versions consistently across GitHub, GGUF, and Hugging Face
+- add automated smoke tests for parse, ingest, query, and export flows
 
 ## Documentation Map
 
