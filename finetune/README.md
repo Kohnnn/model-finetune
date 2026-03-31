@@ -38,6 +38,7 @@ Current local status:
 - Successful GGUF export generated at `finetune/outputs/qwen35_4b_full_corpus_draft23974/gguf/qwen3_5_4b_private_analyst_full_corpus_q4_k_m_gguf/Qwen3.5-4B.Q4_K_M.gguf`
 - Full-run summary generated at `finetune/outputs/qwen35_4b_full_corpus_draft23974/training_summary.json`
 - Private Hugging Face repo uploaded at `Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
+- Private Hugging Face URL: `https://huggingface.co/Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
 
 ## Dataset Requirement
 

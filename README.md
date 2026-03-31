@@ -11,6 +11,7 @@ Private AI analyst stack for local financial research workflows.
 The repository now contains a full end-to-end working path from `raw_dataset/` to:
 
 - a private Hugging Face model: `Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
+- model URL: `https://huggingface.co/Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
 - a deployment-ready GGUF: `finetune/outputs/qwen35_4b_full_corpus_draft23974/gguf/qwen3_5_4b_private_analyst_full_corpus_q4_k_m_gguf/Qwen3.5-4B.Q4_K_M.gguf`
 
 ## What This Repo Does
@@ -31,6 +32,7 @@ The repository now contains a full end-to-end working path from `raw_dataset/` t
 - the local RTX `4060 Ti 16GB` CUDA environment is validated and completed a full LoRA run
 - final full-run artifact: `finetune/outputs/qwen35_4b_full_corpus_draft23974`
 - final private Hugging Face repo: `Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
+- final private Hugging Face URL: `https://huggingface.co/Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
 - final deployment GGUF: `finetune/outputs/qwen35_4b_full_corpus_draft23974/gguf/qwen3_5_4b_private_analyst_full_corpus_q4_k_m_gguf/Qwen3.5-4B.Q4_K_M.gguf`
 
 ## System Architecture

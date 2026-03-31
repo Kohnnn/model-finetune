@@ -83,6 +83,7 @@ This journal records the main engineering decisions, failures, fixes, and milest
 
 - Created and uploaded the merged model to a private Hugging Face repository.
 - Final repo: `Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
+- Final repo URL: `https://huggingface.co/Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
 - Included the merged model, tokenizer/processor files, README, and training summary.
 
 ## 2026-03-31: GGUF Export
