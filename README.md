@@ -383,6 +383,59 @@ Final full-corpus training summary:
 - tag model versions consistently across GitHub, GGUF, and Hugging Face
 - add automated smoke tests for parse, ingest, query, and export flows
 
+## Release Checklist
+
+Use this checklist whenever you cut a new model version.
+
+### Data
+
+- rerun `ocr_pipeline/process_pdfs.py` on the intended source set
+- review `ocr_pipeline/parse_failures.log`
+- confirm disclaimer/contact filtering still looks clean on spot checks
+- regenerate the draft or reviewed SFT dataset
+
+### Training
+
+- record the exact base model and hyperparameters
+- save `training_summary.json`
+- smoke-test a few prompts locally before publishing
+- export both merged HF and GGUF artifacts
+
+### Deployment
+
+- copy the new `.gguf` and `mmproj` files into `deployment/models/`
+- update `deployment/.env` if filenames changed
+- run `python deployment/bootstrap_local.py --ingest-limit 1024` if you want a quick smoke boot
+- verify `/healthz` and one `/query` response
+
+### Publishing
+
+- update `README.md`, `DEVELOPMENT_JOURNAL.md`, and `finetune/QWEN35_TRAINING_NOTES.md`
+- update the Hugging Face model card usage section and roadmap
+- push GitHub commits
+- upload the merged model to the intended Hugging Face repo
+
+## Sharing Policy
+
+### Safe to share
+
+- source code and docs in this repo
+- training commands, hyperparameters, and troubleshooting notes
+- private Hugging Face repo links shared only with approved collaborators
+
+### Keep private
+
+- `raw_dataset/`
+- generated JSONL corpora under `ocr_pipeline/` and `finetune/outputs/datasets/`
+- local deployment secrets in `deployment/.env`
+- local model binaries under `deployment/models/` unless explicitly approved
+
+### Before making anything public
+
+- confirm data rights for the underlying documents
+- verify no proprietary text is embedded in any public dataset release
+- review the model card for private-data references and intended visibility
+
 ## Documentation Map
 
 - `DEVELOPMENT_JOURNAL.md` - chronological engineering journal for the whole stack
