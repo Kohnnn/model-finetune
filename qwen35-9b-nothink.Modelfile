@@ -1,0 +1,3 @@
+# Ollama Modelfile for qwen3.5 without thinking
+FROM qwen3.5:9b
+PARAMETER think false

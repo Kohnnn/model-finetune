@@ -1,28 +1,29 @@
 services:
-  llama:
-    image: ghcr.io/ggml-org/llama.cpp:server
-    container_name: llama_server
-    command: >
-      --ctx-size ${LLAMA_CONTEXT_SIZE:-4096}
-      --threads 3
-      --batch-size 256
-      --parallel 1
-      --no-mmap
-      --chat-template qwen
-      --log-disable
-      -m /models/${LLAMA_MODEL_FILENAME:-qwen3-4b-instruct-q4_k_m.gguf}
-      --mmproj /models/${LLAMA_MMPROJ_FILENAME:-Qwen3.5-4B.BF16-mmproj.gguf}
+  # ── Ollama inference server ────────────────────────────────────────────────
+  # Model is pulled from your public HF repo on first run.
+  # Cached in ollama_data volume — subsequent starts skip re-download.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama_server
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_MODELS=/root/.ollama/models
+      # Model loaded at startup; accessible at http://ollama:11434/v1
+      - OLLAMA_MODEL=hf.co/Mikkkkoooo/qwen35-4b-private-analyst-full-corpus
     volumes:
-      - ./models:/models
+      - ollama_data:/root/.ollama
+    # ollama serve stays in foreground, model auto-loaded via OLLAMA_MODEL
+    command: serve
     deploy:
       resources:
         limits:
-          memory: 3G
+          memory: 6G
           cpus: '3.0'
     networks:
       - internal_net
     restart: unless-stopped
 
+  # ── ChromaDB vector store ──────────────────────────────────────────────────
   chromadb:
     image: chromadb/chroma:0.6.3
     container_name: chroma_server
@@ -40,6 +41,7 @@ services:
       - internal_net
     restart: unless-stopped
 
+  # ── FastAPI RAG app ────────────────────────────────────────────────────────
   app:
     build: ./app
     container_name: custom_app
@@ -49,12 +51,13 @@ services:
     environment:
       - APP_HOST=0.0.0.0
       - APP_PORT=8000
-      - LLAMA_API_URL=http://llama:8080/v1
+      - LLAMA_API_URL=http://ollama:11434/v1
       - CHROMA_API_URL=http://chromadb:8000
       - CHROMA_AUTH_TOKEN=${CHROMA_AUTH_TOKEN:-change-me}
       - CHROMA_COLLECTION_NAME=${CHROMA_COLLECTION_NAME:-research_chunks_v1}
       - EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME:-sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2}
-      - LLM_MODEL_NAME=${LLM_MODEL_NAME:-qwen}
+      # The Ollama model name — matches the HF ref above
+      - LLM_MODEL_NAME=qwen3.5-private-analyst
       - RETRIEVAL_TOP_K=${RETRIEVAL_TOP_K:-4}
       - MAX_CONTEXT_CHARS=${MAX_CONTEXT_CHARS:-12000}
       - LLM_TIMEOUT_SECONDS=${LLM_TIMEOUT_SECONDS:-120}
@@ -63,7 +66,7 @@ services:
       - ./model_cache:/root/.cache
     depends_on:
       - chromadb
-      - llama
+      - ollama
     deploy:
       resources:
         limits:
@@ -73,6 +76,7 @@ services:
       - internal_net
     restart: unless-stopped
 
+  # ── One-shot ChromaDB ingestion ───────────────────────────────────────────
   ingest:
     build: ./app
     profiles:
@@ -91,6 +95,7 @@ services:
     networks:
       - internal_net
 
+  # ── Optional TLS reverse proxy ─────────────────────────────────────────────
   nginx:
     image: nginx:alpine
     container_name: nginx_proxy
@@ -114,3 +119,6 @@ services:
 networks:
   internal_net:
     driver: bridge
+
+volumes:
+  ollama_data:

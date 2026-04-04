@@ -234,6 +234,74 @@ python finetune/export_gguf.py \
 
 ## Roadmap
 
+### Gemma 4 Training
+
+Based on [A Visual Guide to Gemma 4](https://newsletter.maartengrootendorst.com/p/a-visual-guide-to-gemma-4) by Maarten Grootendorst.
+
+![Gemma 4 Family Overview](../assets/gemma4/01_family_overview.png)
+
+The Gemma 4 family includes four models:
+- **Gemma 4 E2B** - Dense model with per-layer embeddings (effectively 2B params)
+- **Gemma 4 E4B** - Dense model with per-layer embeddings (effectively 4B params)
+- **Gemma 4 31B** - Dense model with 31B parameters
+- **Gemma 4 26B A4B** - Mixture of Experts (MoE) with 26B total / 4B active params
+
+![Model Comparison](../assets/gemma4/02_model_comparison.png)
+
+#### Key Architecture Features
+
+**Interleaving Layers** - Global attention is always the last layer, with local (sliding window) attention layers in between.
+
+![Interleaving Layers](../assets/gemma4/05_interleaving_layers.png)
+![Sliding Window Attention](../assets/gemma4/06_sliding_window.png)
+
+**K=V Optimization** - Keys are set equivalent to Values in global attention layers to reduce KV-cache memory.
+
+![K=V Optimization](../assets/gemma4/12_kv_equals.png)
+
+**p-RoPE** - Low-frequency-pruned RoPE applied to embeddings for better long-context handling.
+
+![p-RoPE](../assets/gemma4/16_p_rope.png)
+
+#### Vision Encoder
+
+All Gemma 4 models are multimodal with a Vision Transformer (ViT) encoder supporting variable aspect ratios and resolutions.
+
+![Vision Encoder](../assets/gemma4/18_vision_encoder.png)
+![Variable Aspect Ratio](../assets/gemma4/19_aspect_ratio.png)
+![Variable Resolution](../assets/gemma4/22_variable_resolution.png)
+
+#### Model Variants
+
+**Gemma 4 31B (Dense)** - Vanilla architecture, similar to Gemma 3 with improvements.
+
+![Gemma 4 31B Dense](../assets/gemma4/28_gemma31b.png)
+
+**Gemma 4 26B A4B (MoE)** - Mixture of Experts with 128 experts, 8 activated + 1 shared expert.
+
+![MoE Architecture](../assets/gemma4/29_moe_overview.png)
+![MoE Experts](../assets/gemma4/30_moe_experts.png)
+![Shared Expert](../assets/gemma4/31_shared_expert.png)
+
+**Gemma 4 E2B/E4B (Per-Layer Embeddings)** - Efficient on-device models with embeddings stored in flash memory.
+
+![Per-Layer Embeddings](../assets/gemma4/34_per_layer_embeddings.png)
+![PLE Concept](../assets/gemma4/35_ple_concept.png)
+
+These models also include an **Audio Encoder** (Conformer) for speech processing.
+
+![Audio Encoder](../assets/gemma4/38_audio_encoder.png)
+![Audio Pipeline](../assets/gemma4/40_audio_pipeline.png)
+
+#### Training Plan for Gemma 4
+
+- [ ] Evaluate Gemma 4 31B vs Qwen 3.5 4B for analyst use case
+- [ ] Test Gemma 4 E2B/E4B for on-device deployment
+- [ ] Fine-tune Gemma 4 31B on private corpus using Unsloth
+- [ ] Compare MoE vs Dense fine-tuning efficiency
+- [ ] Export fine-tuned Gemma 4 to GGUF format
+- [ ] Benchmark multimodal (vision) capabilities for document understanding
+
 ### Model quality
 
 - replace draft-generated completions with a curated human-reviewed SFT set
@@ -258,6 +326,44 @@ python finetune/export_gguf.py \
 - tag future model versions consistently across GitHub, GGUF, and Hugging Face
 - automate smoke tests for parse, ingest, query, train, and export flows
 - keep all private corpora and generated datasets out of public distribution
+
+## Learning Resources
+
+All visual guides by [Maarten Grootendorst](https://substack.com/@maartengrootendorst) - excellent LLM education with 50+ custom visuals per post.
+
+### Recommended Reading Order (by relevance to this project)
+
+| # | Topic | Why Relevant | Doc |
+|---|-------|--------------|-----|
+| 1 | [Quantization](./docs/quantization.md) | Deploying GGUF models efficiently | `docs/quantization.md` |
+| 2 | [Mixture of Experts](./docs/moe.md) | Gemma 4 26B A4B uses MoE architecture | `docs/moe.md` |
+| 3 | [Gemma 4](../assets/gemma4/) | Next-gen model family for training | `assets/gemma4/` |
+| 4 | [Reasoning LLMs](./docs/reasoning-llms.md) | Test-time compute, chain-of-thought | `docs/reasoning-llms.md` |
+| 5 | [LLM Agents](./docs/llm-agents.md) | Planning, memory, tools for agents | `docs/llm-agents.md` |
+| 6 | [Mamba](./docs/mamba.md) | Alternative to Transformers | `docs/mamba.md` |
+
+### Quick Descriptions
+
+**[Quantization](./docs/quantization.md)** - Compress models from FP32 to INT8/INT4. Covers GPTQ, GGUF (used in this repo), symmetric/asymmetric quantization, calibration, and QAT.
+
+**[Mixture of Experts](./docs/moe.md)** - Expert routing, load balancing, sparse vs dense parameters. Gemma 4 26B A4B uses 128 experts with 8 activated.
+
+**[Gemma 4](../assets/gemma4/)** - Interleaving layers, K=V optimization, p-RoPE, vision encoder, per-layer embeddings, audio encoder (E2B/E4B).
+
+**[Reasoning LLMs](./docs/reasoning-llms.md)** - Test-time compute scaling, Chain-of-Thought, DeepSeek-R1 training pipeline, PRM vs ORM.
+
+**[LLM Agents](./docs/llm-agents.md)** - Memory (short/long term), Tools (function calling, MCP), Planning (ReAct, Reflexion), Multi-agent systems.
+
+**[Mamba](./docs/mamba.md)** - State space models, selective scan, HiPPO matrix, linear-time inference vs Transformer quadratic.
+
+### Original Blog Posts
+
+- [A Visual Guide to Quantization](https://newsletter.maartengrootendorst.com/p/a-visual-guide-to-quantization)
+- [A Visual Guide to Mixture of Experts](https://newsletter.maartengrootendorst.com/p/a-visual-guide-to-mixture-of-experts)
+- [A Visual Guide to Gemma 4](https://newsletter.maartengrootendorst.com/p/a-visual-guide-to-gemma-4)
+- [A Visual Guide to Reasoning LLMs](https://newsletter.maartengrootendorst.com/p/a-visual-guide-to-reasoning-llms)
+- [A Visual Guide to LLM Agents](https://newsletter.maartengrootendorst.com/p/a-visual-guide-to-llm-agents)
+- [A Visual Guide to Mamba and State Space Models](https://newsletter.maartengrootendorst.com/p/a-visual-guide-to-mamba-and-state)
 
 ## Docs
 
