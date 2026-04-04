@@ -1,125 +1,76 @@
-# Development Journal
+# VietCap Qwen3.5-4B Fine-tuning Development Journal
 
-This journal records the main engineering decisions, failures, fixes, and milestones that turned the folder from a scaffold into a working private analyst stack with a trained Qwen 3.5 model.
+**Project**: Private AI Analyst Stack (OCR -> Fine-tune -> RAG App -> OCI Deployment)
+**Date**: 2026-03-31 | **Status**: In Progress
 
-## 2026-03-28 to 2026-03-29: Repository Read and RAG-First MVP
+## Reference Pipeline (Jackrong Opus Distillation)
+Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-v2-GGUF:
+- Base: Qwen/Qwen3.5-27B, Framework: Unsloth LoRA SFT
+- Training format: <thinking> {reasoning} 
+ {answer}, <|im_start|> chat template
+- Starting loss: 0.74356 -> Final: 0.23984, Context: 16,384 tokens
 
-- Mapped the repository and confirmed the OCR pipeline was the most complete subsystem.
-- Chose a RAG-first path because the corpus was already large while the fine-tuning dataset still had empty assistant completions.
-- Implemented a FastAPI retrieval app, Chroma ingestion flow, Docker packaging, bootstrap script, and deployment docs.
-- Brought up the local stack with Chroma, llama.cpp, and the app service.
-- Added source-grounded fallbacks so the app returned extractive evidence when the local smoke-test GGUF was too weak.
+Datasets used: nohurry/Opus-4.6-Reasoning-3000x-filtered (2330 rows),
+Roman1111111/claude-opus-4.6-10000x (9633 rows),
+TeichAI/claude-4.5-opus-high-reasoning-250x (250 rows),
+Jackrong/Qwen3.5-reasoning-700x (633 rows)
 
-## 2026-03-29: Parser Cleanup and Training Preparation
+## Our Simplified Pipeline (Two-Phase)
+Base: Jackrong/Qwen3.5-4B-Claude-4.6-Opus-Reasoning-Distilled-GGUF (already distilled 4B)
 
-- Expanded `ocr_pipeline/process_pdfs.py` to strip disclaimer and contact sections in both English and Vietnamese.
-- Added metadata such as `doc_id`, `title`, `year`, `language`, `chunk_index`, and `chunk_word_count` to retrieval and SFT outputs.
-- Regenerated the cleaned OCR outputs from `raw_dataset/`.
-- Final cleaned parse result:
-  - supported files discovered: `8180`
-  - successfully processed: `8179`
-  - cleaned chunks: `23978`
-  - remaining failure: `ocr_pipeline/parse_failures.log` -> `SIP-20231101-KQKD.docx`
+Phase 1: Fine-tune on Opus reasoning datasets -> sharpen analytical thinking
+  Dataset: finetune/outputs/datasets/opus_reasoning.jsonl (~5000-6000 rows)
+  Command: python finetune/train.py --model-name Jackrong/Qwen3.5-4B-Claude-4.6-Opus-Reasoning-Distilled
+    --dataset-path finetune/outputs/datasets/opus_reasoning.jsonl
+    --learning-rate 5e-5 --weight-decay 0.05 --num-epochs 1
 
-## 2026-03-29: GPU Environment Repair for Qwen 3.5
+Phase 2: Fine-tune on VietCap private data -> domain adaptation
+  Step 2a: python finetune/generate_sft_dataset.py (Ollama generation)
+  Step 2b: python finetune/train.py --dataset-path finetune/outputs/datasets/vietcap_sft_generated.jsonl
+    --learning-rate 2e-5 --weight-decay 0.05 --num-epochs 1
 
-- Verified the machine had an RTX 4060 Ti 16GB but the Python environment was still CPU-only.
-- Upgraded the local `.venv` to CUDA PyTorch `2.11.0+cu128`.
-- Upgraded `transformers` and refreshed `unsloth` plus `unsloth-zoo` from source so `qwen3_5` would load correctly.
-- Added `finetune/setup_gpu_env.ps1` so the GPU environment is reproducible.
-- Stored `HF_TOKEN` locally as a user-scoped environment variable.
+## Created: download_opus_datasets.py
+- Downloads all 4 Opus datasets via `datasets` library
+- Converts flat/conversation/message formats -> unified {"messages": [...]} JSONL
+- Roman dataset filtered by metadata.category in ("simple logic and math", "math")
+- System prompt: "You are a helpful assistant. Please reason step by step before answering."
 
-## 2026-03-29 to 2026-03-30: Training Script Stabilization
+## process_pdfs.py Syntax Fixes
+- Fixed literal newline characters injected by heredoc edits in string literals
+  (e.g., `text.split('` + newline + `')` -> `text.split('\n')`)
+- All files verified: `python -m py_compile` passes, `ruff check` passes (0 errors)
 
-- Hardened `finetune/train.py` for `unsloth/Qwen3.5-4B`.
-- Added CUDA and model-config preflight checks.
-- Added compatibility handling for:
-  - `eval_strategy` versus `evaluation_strategy`
-  - `processing_class` versus tokenizer arguments in `Trainer`
-  - processor-backed tokenization for Qwen 3.5
-- Added merged-model saving and Hugging Face push options.
-- Added `training_summary.json` generation for completed runs.
-- Added `finetune/export_gguf.py` so a completed adapter can be exported without retraining.
+## Noise Filters Added to process_pdfs.py
+- min_chunk_words: 50 -> 200
+- HEAD_SECTION_MARKERS: strip leading boilerplate (mirrors existing TAIL_SECTION_MARKERS)
+- NOISE_PATTERNS regex: Figure captions, Page numbers, ToC, Termination notices,
+  Source citations, Rating legends, Financial report fragments, Rating system boilerplate
+- Require >= 2 ANALYTICAL_MARKERS per chunk (target price, valuation, earnings, etc.)
+- Excessive number detection: reject if >30% of characters are digits (table/chart noise)
 
-## 2026-03-30: Full-Corpus Draft Dataset
+## generate_sft_dataset.py Fixes
+- CRITICAL: Added out_fh.write() - file was opened at line 233 but never written (BUG)
+- Added try/except around json.loads() at line 163 - was crashing on malformed JSON lines
+- Added Ollama retry with exponential backoff (2^attempt seconds)
 
-- Generated a full-corpus draft SFT file at `finetune/outputs/datasets/qwen35_full_corpus_draft.jsonl`.
-- This dataset uses cleaned OCR context with heuristic draft completions.
-- Final draft row count: `23974`
-- Average truncated context length: about `409` words.
+## train.py Updated Defaults
+- --learning-rate: 2e-4 -> 5e-5
+- --weight-decay: 0.01 -> 0.05
+- --num-epochs: 3.0 -> 1.0
+- --model-name: unsloth/Qwen3.5-4B -> Jackrong/Qwen3.5-4B-Claude-4.6-Opus-Reasoning-Distilled
 
-## 2026-03-30: Full Qwen 3.5 Fine-Tune
+## System Prompt (VietCap Analyst)
+You are a senior equity research analyst at VietCap Securities.
+Based ONLY on the provided context, deliver concise, evidence-based analytical commentary.
+Cite specific data points inline as [S1], [S2] when using evidence.
+Do NOT copy full sentences. Paraphrase and synthesize.
+Structure: 1) Key thesis, 2) Supporting evidence, 3) Risks and caveats
 
-- Ran the full local LoRA training job against the full-corpus draft set.
-- Final training command used:
+## Output Paths
+finetune/outputs/datasets/opus_reasoning.jsonl       - Opus reasoning data
+finetune/outputs/datasets/vietcap_sft_generated.jsonl - VietCap with generated responses
+finetune/outputs/qwen35_4b_opus_reasoning/merged_model/  - Phase 1 model
+finetune/outputs/qwen35_4b_vietcap_final/merged_model/   - Phase 2 model
+finetune/outputs/qwen35_4b_vietcap_final/gguf/            - GGUF export
 
-```powershell
-.venv\Scripts\python.exe finetune/train.py \
-  --dataset-path finetune/outputs/datasets/qwen35_full_corpus_draft.jsonl \
-  --output-dir finetune/outputs/qwen35_4b_full_corpus_draft23974 \
-  --max-seq-length 1024 \
-  --batch-size 1 \
-  --gradient-accumulation 4 \
-  --num-epochs 1 \
-  --eval-split 0 \
-  --log-steps 100 \
-  --save-steps 500 \
-  --warmup-steps 100 \
-  --save-merged-model \
-  --skip-gguf-export \
-  --disable-response-only-masking
-```
-
-- Final result:
-  - output dir: `finetune/outputs/qwen35_4b_full_corpus_draft23974`
-  - train rows: `23974`
-  - epochs: `1.0`
-  - runtime: `68249.53s` (~`18.96h`)
-  - train loss: `1.0765`
-  - adapter size: about `0.10 GB`
-  - merged model size: about `8.70 GB`
-
-## 2026-03-30: Private Hugging Face Publication
-
-- Created and uploaded the merged model to a private Hugging Face repository.
-- Final repo: `Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
-- Final repo URL: `https://huggingface.co/Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
-- Included the merged model, tokenizer/processor files, README, and training summary.
-
-## 2026-03-31: GGUF Export
-
-- Initial GGUF export failed because Unsloth could not auto-install or detect the local `llama.cpp` toolchain on Windows.
-- Installed Visual Studio Build Tools and used the existing local CMake installation.
-- Manually cloned and built `llama.cpp` under `C:\Users\Admin\.unsloth\llama.cpp`.
-- Added Windows path and OpenSSL detection fixes in `finetune/export_gguf.py`.
-- Final GGUF export succeeded.
-
-Generated GGUF artifacts:
-
-- `finetune/outputs/qwen35_4b_full_corpus_draft23974/gguf/qwen3_5_4b_private_analyst_full_corpus_q4_k_m_gguf/Qwen3.5-4B.Q4_K_M.gguf`
-- `finetune/outputs/qwen35_4b_full_corpus_draft23974/gguf/qwen3_5_4b_private_analyst_full_corpus_q4_k_m_gguf/Qwen3.5-4B.BF16-mmproj.gguf`
-
-Approximate GGUF directory size: `3.15 GB`
-
-## 2026-03-31: Commit-Ready Cleanup
-
-- Removed temporary smoke-training folders.
-- Removed intermediate pilot parse outputs.
-- Removed the old draft-only and CPU-seed outputs from `finetune/outputs/`.
-- Initialized a local git repository with `git init`.
-- Updated `.gitignore` to exclude `.agent/` and `unsloth_compiled_cache/` in addition to existing large/private assets.
-
-## Final Artifact Ledger
-
-- Full dataset draft set: `finetune/outputs/datasets/qwen35_full_corpus_draft.jsonl`
-- Full adapter: `finetune/outputs/qwen35_4b_full_corpus_draft23974/adapter`
-- Full merged model: `finetune/outputs/qwen35_4b_full_corpus_draft23974/merged_model`
-- Full training summary: `finetune/outputs/qwen35_4b_full_corpus_draft23974/training_summary.json`
-- GGUF export: `finetune/outputs/qwen35_4b_full_corpus_draft23974/gguf/qwen3_5_4b_private_analyst_full_corpus_q4_k_m_gguf`
-- Private Hugging Face repo: `Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
-
-## Current Recommendation
-
-- Use the private Hugging Face model for experimentation and evaluation now.
-- Use the GGUF artifact for deployment testing.
-- For a stronger final house-style model, review the highest-value examples in the full-corpus draft set and rerun the same training pipeline on that curated dataset.
+Last updated: 2026-03-31

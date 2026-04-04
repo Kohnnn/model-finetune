@@ -9,6 +9,8 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
+.venv311/
+venv311/
 .agent/
 unsloth_compiled_cache/
 
@@ -34,3 +36,4 @@ deployment/benchmarks/latest_report.md
 # Misc
 trace_dill.txt
 trace_ds.txt
+command

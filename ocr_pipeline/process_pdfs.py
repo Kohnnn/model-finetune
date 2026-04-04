@@ -51,6 +51,35 @@ CONTACT_PAGE_MARKERS = [
     "decker&co",
 ]
 
+HEAD_SECTION_MARKERS = [
+    "update report",
+    "see important disclosure",
+    "www.vietcap.com.vn",
+    "vietcap securities",
+    "disclaimer",
+]
+
+NOISE_PATTERNS = [
+    r"(?i)^\s*figure\s*\d+.*?source:\s*",
+    r"(?i)^\s*bảng\s*\d+.*?nguồn:\s*",
+    r"(?i)^\s*table\s*\d+.*?source:\s*",
+    r"(?i)^\s*page\s*\d+\s+of\s+\d+",
+    r"(?i)^\s*\d{1,3}\.\s+[a-z\-\s]+$",
+    r"(?i)^\s*mục\s*lục\s*c",
+    r"(?i)^\s*tài\s*liệu\s*tham\s*khảo",
+    r"(?i)nguồn:\s*\w+",
+    r"(?i)ngừng\s*theo\s*dõi",
+    r"(?i)báo\s*cáo\s*tài\s*chính\s*nguồn:",
+    r"(?i)^\s*[+\-]?\$?[\d,\.]+\s*%?$",
+    r"(?i)^\s*[+\-]?\d+\.?\d*%\s*$",
+    r"(?i)(buy|sell|outperform|underperform|neutral)\s*=\s*",
+    r"(?i)vietcap rating system",
+    r"(?i)^\+?\d{6,}",
+    r"(?i)^\s*[ 	]+$",
+]
+
+_NOISE_PATTERN_RE = [re.compile(p) for p in NOISE_PATTERNS]
+
 ANALYTICAL_MARKERS = [
     "target price",
     "valuation",
@@ -148,8 +177,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-chunk-words",
         type=int,
-        default=50,
-        help="Discard chunks smaller than this threshold (default: 50).",
+        default=200,
+        help="Discard chunks smaller than this threshold (default: 200).",
     )
     parser.add_argument(
         "--trim-tail-pages",
@@ -219,6 +248,44 @@ def normalize_for_matching(text: str) -> str:
 def count_marker_hits(text: str, markers: list[str]) -> int:
     normalized = normalize_for_matching(text)
     return sum(normalize_for_matching(marker) in normalized for marker in markers)
+
+
+def strip_head_boilerplate(text: str) -> str:
+    text_lower = normalize_for_matching(text)
+    found_marker = None
+    found_idx = len(text)
+    for marker in HEAD_SECTION_MARKERS:
+        norm_marker = normalize_for_matching(marker)
+        idx = text_lower.find(norm_marker)
+        if idx != -1 and idx < found_idx:
+            found_idx = idx
+            found_marker = marker
+    if found_marker is None:
+        return text
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        line_lower = normalize_for_matching(line)
+        if normalize_for_matching(found_marker) in line_lower:
+            return "\n".join(lines[i + 1 :]).strip()
+    return text
+
+
+def matches_noise_pattern(text: str) -> bool:
+    for pattern_re in _NOISE_PATTERN_RE:
+        if pattern_re.search(text):
+            return True
+    return False
+
+
+def has_excessive_numbers(text: str) -> bool:
+    if not text:
+        return False
+    digits = sum(c.isdigit() for c in text)
+    return (digits / len(text)) > 0.30
+
+
+def count_analytical_markers(text: str) -> int:
+    return count_marker_hits(text, ANALYTICAL_MARKERS)
 
 
 def is_boilerplate_page(text: str) -> bool:
@@ -393,13 +460,14 @@ def trim_tail_sections(pages: list[str], trim_tail_pages: int) -> list[str]:
 def is_boilerplate_chunk(text: str) -> bool:
     normalized = normalize_for_matching(text)
     if not normalized:
-        return False
+        return True
 
+    word_count = len(text.split())
     tail_hits = count_marker_hits(text, TAIL_SECTION_MARKERS)
     contact_hits = count_marker_hits(text, CONTACT_PAGE_MARKERS)
-    analytical_hits = count_marker_hits(text, ANALYTICAL_MARKERS)
+    analytical_hits = count_analytical_markers(text)
 
-    if contact_hits >= 1 and len(text.split()) <= 220:
+    if contact_hits >= 1 and word_count <= 220:
         return True
     if (
         "analyst certification" in normalized
@@ -410,7 +478,23 @@ def is_boilerplate_chunk(text: str) -> bool:
         return True
     if tail_hits >= 3:
         return True
+    if matches_noise_pattern(text):
+        return True
+    if has_excessive_numbers(text):
+        return True
     return False
+
+
+def is_quality_chunk(text: str) -> bool:
+    if is_boilerplate_chunk(text):
+        return False
+    word_count = len(text.split())
+    if word_count < 200:
+        return False
+    analytical_count = count_analytical_markers(text)
+    if analytical_count < 2:
+        return False
+    return True
 
 
 def chunk_text(
@@ -471,13 +555,14 @@ def process_dataset(args: argparse.Namespace) -> None:
             text = "\n\n".join(pages)
             text = strip_vcsc_disclaimers(text)
             document_metadata = build_document_metadata(file_path, args.input_dir, text)
+            text = strip_head_boilerplate(text)
             chunks = chunk_text(
                 text=text,
                 chunk_words=args.chunk_words,
                 overlap_words=args.overlap_words,
                 min_chunk_words=args.min_chunk_words,
             )
-            chunks = [chunk for chunk in chunks if not is_boilerplate_chunk(chunk)]
+            chunks = [chunk for chunk in chunks if is_quality_chunk(chunk)]
 
             if not chunks:
                 LOGGER.warning(

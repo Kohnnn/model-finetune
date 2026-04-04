@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-name",
-        default="unsloth/Qwen3.5-4B",
+        default="Jackrong/Qwen3.5-4B-Claude-4.6-Opus-Reasoning-Distilled",
         help="Base model to fine-tune.",
     )
     parser.add_argument(
@@ -46,26 +46,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1,
-        help="Per-device batch size (default: 1).",
+        default=4,
+        help="Per-device batch size (default: 4).",
     )
     parser.add_argument(
         "--gradient-accumulation",
         type=int,
-        default=8,
-        help="Gradient accumulation steps (default: 8).",
+        default=2,
+        help="Gradient accumulation steps (default: 2).",
+    )
+    parser.add_argument(
+        "--max-memory-ratio",
+        type=float,
+        default=0.85,
+        help="Max GPU memory usage ratio before reducing batch size (default: 0.85).",
     )
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=2e-4,
-        help="Learning rate (default: 2e-4).",
+        default=5e-5,
+        help="Learning rate (default: 5e-5).",
     )
     parser.add_argument(
         "--num-epochs",
         type=float,
-        default=3.0,
-        help="Number of train epochs (default: 3).",
+        default=1.0,
+        help="Number of train epochs (default: 1.0).",
     )
     parser.add_argument(
         "--eval-split",
@@ -118,8 +124,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--weight-decay",
         type=float,
-        default=0.01,
-        help="Weight decay (default: 0.01, increase to 0.05-0.1 if overfitting).",
+        default=0.05,
+        help="Weight decay (default: 0.05).",
     )
     parser.add_argument(
         "--optim",
@@ -187,6 +193,14 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Validate and format dataset only; do not initialize model/training.",
+    )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        nargs="?",
+        const="True",
+        default=None,
+        help="Resume training from checkpoint. Pass a path to resume from that checkpoint, "
+        "or 'True' to auto-resume from the latest checkpoint in output-dir.",
     )
     parser.add_argument(
         "--log-level",
@@ -673,6 +687,16 @@ def run_training(args: argparse.Namespace) -> int:
         token=hub_token,
     )
     save_tokenizer = tokenizer
+
+    free_mem, total_mem = torch.cuda.mem_get_info()
+    max_allowed = total_mem * args.max_memory_ratio
+    if free_mem < max_allowed * 0.3:
+        LOGGER.warning(
+            "GPU memory low! free=%.1f GiB, total=%.1f GiB. "
+            "Consider reducing --batch-size.",
+            free_mem / 1024**3,
+            total_mem / 1024**3,
+        )
     training_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
     if getattr(training_tokenizer, "pad_token", None) is None:
         training_tokenizer.pad_token = training_tokenizer.eos_token
@@ -702,6 +726,22 @@ def run_training(args: argparse.Namespace) -> int:
         use_rslora=False,
         loftq_config=None,
     )
+
+    free_mem, total_mem = torch.cuda.mem_get_info()
+    max_allowed = total_mem * args.max_memory_ratio
+    LOGGER.info(
+        "GPU memory after model load: free=%.1f GiB / %.1f GiB (%.0f%% free, threshold=%.0f%%)",
+        free_mem / 1024**3,
+        total_mem / 1024**3,
+        (free_mem / total_mem) * 100,
+        (1 - args.max_memory_ratio) * 100,
+    )
+    if free_mem < total_mem * (1 - args.max_memory_ratio):
+        LOGGER.warning(
+            "GPU memory usage exceeded --max-memory-ratio=%.0f%%! "
+            "Reduce --batch-size or increase --gradient-accumulation.",
+            args.max_memory_ratio * 100,
+        )
 
     dataset = format_chat_examples(
         dataset,
@@ -778,7 +818,7 @@ def run_training(args: argparse.Namespace) -> int:
     trainer = Trainer(**trainer_kwargs)
 
     LOGGER.info("Starting training...")
-    result = trainer.train()
+    result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     LOGGER.info("Training complete. Metrics: %s", result.metrics)
     write_training_summary(
         output_dir,
@@ -824,7 +864,7 @@ def main() -> int:
 
     try:
         return run_training(args)
-    except Exception as exc:  # noqa: PERF203
+    except Exception:  # noqa: PERF203
         LOGGER.exception("Training failed:")
         return 1
 

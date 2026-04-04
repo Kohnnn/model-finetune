@@ -51,7 +51,7 @@ def get_settings() -> Settings:
             "EMBEDDING_MODEL_NAME",
             "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         ),
-        llm_model_name=os.getenv("LLM_MODEL_NAME", "qwen"),
+        llm_model_name=os.getenv("LLM_MODEL_NAME", "qwen3.5-private-analyst"),
         retrieval_top_k=_read_int("RETRIEVAL_TOP_K", 4),
         llm_temperature=_read_float("LLM_TEMPERATURE", 0.1),
         llm_max_tokens=_read_int("LLM_MAX_TOKENS", 900),
