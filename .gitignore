@@ -37,3 +37,4 @@ deployment/benchmarks/latest_report.md
 trace_dill.txt
 trace_ds.txt
 command
+outputs/datasets/vietcap_sft_generated.jsonl
