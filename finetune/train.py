@@ -432,7 +432,7 @@ def split_dataset(dataset, eval_split: float, seed: int):
 
 def maybe_mask_non_assistant_tokens(trainer, tokenizer, disable: bool):
     if disable:
-        LOGGER.info("Skipping response-only masking (--disable-response-only-masking).")
+        LOGGER.info("Response-only masking DISABLED via flag.")
         return trainer
 
     chat_template = getattr(tokenizer, "chat_template", "") or ""
@@ -445,11 +445,13 @@ def maybe_mask_non_assistant_tokens(trainer, tokenizer, disable: bool):
     try:
         from unsloth.chat_templates import train_on_responses_only
 
-        return train_on_responses_only(
+        trainer = train_on_responses_only(
             trainer,
             instruction_part="<|im_start|>user\n",
             response_part="<|im_start|>assistant\n",
         )
+        LOGGER.info("Response-only masking ENABLED.")
+        return trainer
     except Exception as exc:  # noqa: PERF203
         LOGGER.warning(
             "Could not enable response-only masking; continuing without it: %s", exc
@@ -547,7 +549,22 @@ def log_gpu_state(torch) -> None:
     )
 
 
-def verify_model_support(model_name: str, hub_token: str | None, auto_config) -> None:
+def verify_model_support(
+    model_name: str, hub_token: str | None, auto_config
+) -> str | None:
+    from huggingface_hub import snapshot_download
+
+    revision = None
+    try:
+        revision = snapshot_download(
+            model_name,
+            revision=None,
+            token=hub_token,
+            quiet=True,
+        )
+    except Exception:
+        pass
+
     try:
         config = auto_config.from_pretrained(
             model_name,
@@ -565,6 +582,9 @@ def verify_model_support(model_name: str, hub_token: str | None, auto_config) ->
         getattr(config, "model_type", "unknown"),
         getattr(config, "architectures", []),
     )
+    if revision:
+        LOGGER.info("Base model commit: %s", revision)
+    return revision
 
 
 def build_training_arguments(
@@ -623,9 +643,11 @@ def write_training_summary(
     train_rows: int,
     eval_rows: int,
     metrics: dict[str, Any],
+    base_model_revision: str | None = None,
 ) -> None:
     payload = {
         "base_model": args.model_name,
+        "base_model_revision": base_model_revision,
         "dataset_path": str(args.dataset_path),
         "output_dir": str(output_dir),
         "train_rows": train_rows,
@@ -677,7 +699,7 @@ def run_training(args: argparse.Namespace) -> int:
         raise RuntimeError("CUDA GPU is required for this training script.")
 
     log_gpu_state(torch)
-    verify_model_support(args.model_name, hub_token, AutoConfig)
+    base_model_revision = verify_model_support(args.model_name, hub_token, AutoConfig)
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model_name,
@@ -793,12 +815,6 @@ def run_training(args: argparse.Namespace) -> int:
         save_steps=args.save_steps,
     )
 
-    if not args.disable_response_only_masking:
-        LOGGER.warning(
-            "The current Qwen 3.5 training path uses tokenized full-sequence training. "
-            "Response-only masking is not applied in this backend."
-        )
-
     trainer_kwargs = {
         "model": model,
         "train_dataset": train_dataset,
@@ -816,6 +832,9 @@ def run_training(args: argparse.Namespace) -> int:
         trainer_kwargs["tokenizer"] = training_tokenizer
 
     trainer = Trainer(**trainer_kwargs)
+    trainer = maybe_mask_non_assistant_tokens(
+        trainer, training_tokenizer, disable=args.disable_response_only_masking
+    )
 
     LOGGER.info("Starting training...")
     result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
@@ -826,6 +845,7 @@ def run_training(args: argparse.Namespace) -> int:
         train_rows=len(train_dataset),
         eval_rows=len(eval_dataset) if eval_dataset is not None else 0,
         metrics=result.metrics,
+        base_model_revision=base_model_revision,
     )
 
     LOGGER.info("Saving LoRA adapter to %s", adapter_dir)

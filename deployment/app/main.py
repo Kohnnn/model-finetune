@@ -106,8 +106,10 @@ class RAGService:
             return INSUFFICIENT_EVIDENCE_ANSWER
         answer = message.strip()
         if not answer_is_grounded(answer):
-            LOGGER.warning("Model returned ungrounded answer; using fallback evidence")
-            return build_fallback_answer(chunks)
+            LOGGER.warning(
+                "Model returned ungrounded answer; returning insufficient evidence"
+            )
+            return INSUFFICIENT_EVIDENCE_ANSWER
         return answer
 
 

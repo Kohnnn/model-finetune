@@ -2,6 +2,9 @@ services:
   # ── Ollama inference server ────────────────────────────────────────────────
   # Model is pulled from your public HF repo on first run.
   # Cached in ollama_data volume — subsequent starts skip re-download.
+  #
+  # For local GGUF deployment (e.g. trained recovery model), use the
+  # llama-server service below instead of this one.
   ollama:
     image: ollama/ollama:latest
     container_name: ollama_server
@@ -9,7 +12,7 @@ services:
       - OLLAMA_HOST=0.0.0.0
       - OLLAMA_MODELS=/root/.ollama/models
       # Model loaded at startup; accessible at http://ollama:11434/v1
-      - OLLAMA_MODEL=hf.co/Mikkkkoooo/qwen35-4b-private-analyst-full-corpus
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-hf.co/Mikkkkoooo/qwen35-4b-private-analyst-full-corpus}
     volumes:
       - ollama_data:/root/.ollama
     # ollama serve stays in foreground, model auto-loaded via OLLAMA_MODEL
@@ -22,6 +25,36 @@ services:
     networks:
       - internal_net
     restart: unless-stopped
+    profiles:
+      - ollama
+
+  # ── llama.cpp server for local GGUF ───────────────────────────────────────
+  # Use this instead of ollama when deploying a local GGUF file.
+  # Set LLM_MODEL_PATH env var to the model file name in /models
+  llama-server:
+    image: ghcr.io/ggerganov/llama.cpp:server
+    container_name: llama_server
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8080
+      - MODEL=/models/${LLM_MODEL:-Qwen3.5-4B.Clean-Recovery.Q4_K_M.gguf}
+      - N_ctx=8192
+      - N_gpu_layers=32
+      - THREADS=4
+    volumes:
+      - ./models:/models:ro
+    ports:
+      - "8080:8080"
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+          cpus: '3.0'
+    networks:
+      - internal_net
+    restart: unless-stopped
+    profiles:
+      - localgguf
 
   # ── ChromaDB vector store ──────────────────────────────────────────────────
   chromadb:
@@ -40,6 +73,12 @@ services:
     networks:
       - internal_net
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/heartbeat || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   # ── FastAPI RAG app ────────────────────────────────────────────────────────
   app:
@@ -51,13 +90,14 @@ services:
     environment:
       - APP_HOST=0.0.0.0
       - APP_PORT=8000
-      - LLAMA_API_URL=http://ollama:11434/v1
+      # Use llama-server (localgguf profile) or ollama (ollama profile)
+      - LLAMA_API_URL=${LLAMA_API_URL:-http://llama-server:8080/v1}
       - CHROMA_API_URL=http://chromadb:8000
       - CHROMA_AUTH_TOKEN=${CHROMA_AUTH_TOKEN:-change-me}
       - CHROMA_COLLECTION_NAME=${CHROMA_COLLECTION_NAME:-research_chunks_v1}
       - EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME:-sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2}
-      # The Ollama model name — matches the HF ref above
-      - LLM_MODEL_NAME=qwen3.5-private-analyst
+      # The Ollama model name — used only when LLAMA_API_URL points to Ollama
+      - LLM_MODEL_NAME=${LLM_MODEL_NAME:-qwen3.5-private-analyst}
       - RETRIEVAL_TOP_K=${RETRIEVAL_TOP_K:-4}
       - MAX_CONTEXT_CHARS=${MAX_CONTEXT_CHARS:-12000}
       - LLM_TIMEOUT_SECONDS=${LLM_TIMEOUT_SECONDS:-120}
@@ -65,8 +105,10 @@ services:
       - ../ocr_pipeline:/data/ocr_pipeline:ro
       - ./model_cache:/root/.cache
     depends_on:
-      - chromadb
-      - ollama
+      chromadb:
+        condition: service_healthy
+      # ollama:  # active only with "ollama" profile
+      # llama-server:  # active only with "localgguf" profile
     deploy:
       resources:
         limits:
