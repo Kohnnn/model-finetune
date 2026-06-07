@@ -53,12 +53,19 @@ python deployment/bootstrap_local.py
 
 The bootstrap script will:
 
-1. validate `.env`, dataset, and GGUF model path
-2. start `chromadb` and `llama`
+1. validate `.env`, dataset, and (for `localgguf`) the GGUF model path
+2. start `chromadb` and the selected inference service (`llama-server` for the
+   default `localgguf` backend, or `ollama` for `--inference ollama`)
 3. run ingestion unless `--skip-ingest` is used
-4. start the app
+4. start the app (pointing it at the chosen backend)
 5. verify `http://localhost:8000/healthz`
 6. optionally start nginx when `--with-proxy` is passed
+
+By default the script uses the local GGUF backend. To use Ollama instead:
+
+```bash
+python deployment/bootstrap_local.py --inference ollama
+```
 
 Smoke-test the full flow on a subset first:
 

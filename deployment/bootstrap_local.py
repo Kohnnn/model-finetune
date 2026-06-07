@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -18,6 +19,15 @@ COMPOSE_FILE = DEPLOYMENT_DIR / "docker-compose.yml"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Validate local deployment settings and boot the RAG MVP stack."
+    )
+    parser.add_argument(
+        "--inference",
+        choices=["localgguf", "ollama"],
+        default="localgguf",
+        help=(
+            "Inference backend to start. 'localgguf' runs the llama.cpp server from a "
+            "local GGUF file (default); 'ollama' pulls the model from Hugging Face."
+        ),
     )
     parser.add_argument(
         "--skip-ingest",
@@ -71,30 +81,32 @@ def require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
-def validate_inputs(env_values: dict[str, str], with_proxy: bool) -> None:
+def validate_inputs(env_values: dict[str, str], with_proxy: bool, inference: str) -> None:
     chroma_token = env_values.get("CHROMA_AUTH_TOKEN", "")
     require(
         chroma_token not in {"", "change-me", "replace-with-a-long-random-token"},
         "Set CHROMA_AUTH_TOKEN in deployment/.env to a real secret value.",
     )
 
-    model_filename = env_values.get("LLAMA_MODEL_FILENAME", "Qwen3.5-4B.Q4_K_M.gguf")
-    model_path = DEPLOYMENT_DIR / "models" / model_filename
-    require(
-        model_path.exists(),
-        f"Model file not found: {model_path}. Place your GGUF model in deployment/models.",
-    )
+    if inference == "localgguf":
+        # docker-compose 'llama-server' reads MODEL=/models/${LLM_MODEL:-...};
+        # keep this default in sync with docker-compose.yml.
+        model_filename = env_values.get("LLM_MODEL", "Qwen3.5-4B.Clean-Recovery.Q4_K_M.gguf")
+        model_path = DEPLOYMENT_DIR / "models" / model_filename
+        require(
+            model_path.exists(),
+            f"Model file not found: {model_path}. Place your GGUF model in deployment/models "
+            "or set LLM_MODEL in deployment/.env.",
+        )
 
-    mmproj_filename = env_values.get("LLAMA_MMPROJ_FILENAME", "").strip()
-    require(
-        bool(mmproj_filename),
-        "Set LLAMA_MMPROJ_FILENAME in deployment/.env for the exported Qwen 3.5 companion file.",
-    )
-    mmproj_path = DEPLOYMENT_DIR / "models" / mmproj_filename
-    require(
-        mmproj_path.exists(),
-        f"mmproj file not found: {mmproj_path}. Place the exported mmproj file in deployment/models.",
-    )
+        mmproj_filename = env_values.get("LLAMA_MMPROJ_FILENAME", "").strip()
+        if mmproj_filename:
+            mmproj_path = DEPLOYMENT_DIR / "models" / mmproj_filename
+            require(
+                mmproj_path.exists(),
+                f"mmproj file not found: {mmproj_path}. Place the exported mmproj file in "
+                "deployment/models or unset LLAMA_MMPROJ_FILENAME.",
+            )
 
     dataset_path = REPO_ROOT / "ocr_pipeline" / "chroma_chunks.jsonl"
     require(
@@ -111,7 +123,7 @@ def validate_inputs(env_values: dict[str, str], with_proxy: bool) -> None:
         )
 
 
-def run_compose(*args: str) -> None:
+def run_compose(*args: str, extra_env: dict[str, str] | None = None) -> None:
     command = [
         "docker",
         "compose",
@@ -121,7 +133,10 @@ def run_compose(*args: str) -> None:
         str(ENV_PATH),
         *args,
     ]
-    subprocess.run(command, cwd=REPO_ROOT, check=True)
+    env = None
+    if extra_env:
+        env = {**os.environ, **extra_env}
+    subprocess.run(command, cwd=REPO_ROOT, check=True, env=env)
 
 
 def run_compose_with_retries(
@@ -168,9 +183,13 @@ def main() -> int:
 
     try:
         env_values = read_env_file(ENV_PATH)
-        validate_inputs(env_values, with_proxy=args.with_proxy)
+        validate_inputs(env_values, with_proxy=args.with_proxy, inference=args.inference)
 
-        run_compose("up", "-d", "chromadb", "llama")
+        # The inference services are profile-gated in docker-compose.yml:
+        #   localgguf -> llama-server   |   ollama -> ollama
+        inference_service = "llama-server" if args.inference == "localgguf" else "ollama"
+        run_compose("up", "-d", "chromadb")
+        run_compose("--profile", args.inference, "up", "-d", inference_service)
 
         if not args.skip_ingest:
             ingest_command = [
@@ -195,7 +214,13 @@ def main() -> int:
                 delay_seconds=5,
             )
 
-        run_compose("up", "-d", "app")
+        # Point the app at the chosen inference backend. The compose default
+        # targets llama-server; override it when running the ollama profile so
+        # the user's deployment/.env LLAMA_API_URL does not have to change.
+        app_env: dict[str, str] = {}
+        if args.inference == "ollama" and "LLAMA_API_URL" not in env_values:
+            app_env["LLAMA_API_URL"] = "http://ollama:11434/v1"
+        run_compose("up", "-d", "app", extra_env=app_env or None)
         wait_for_health(args.health_timeout_seconds)
 
         if args.with_proxy:

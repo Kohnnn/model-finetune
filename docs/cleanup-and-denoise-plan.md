@@ -147,7 +147,10 @@ Roughly in priority order:
    a fresh GGUF with known provenance (avoid the untrusted Ollama-derived lineage).
 4. **Fix the bootstrap/compose mismatch** noted in `AGENTS.md`: `bootstrap_local.py` starts
    a `llama` service while `docker-compose.yml` defines `llama-server`/`ollama` under
-   profiles.
+   profiles. **(Done 2026-06)** — `bootstrap_local.py` now takes `--inference
+   {localgguf,ollama}` (default `localgguf`), starts the correct profile-gated service,
+   validates the `LLM_MODEL` GGUF for local runs, and points the app at the right backend.
+   Covered by `tests/test_bootstrap_local.py`.
 5. **Add an exporter regression test** under `tests/` for the new noise/dedup logic.
 6. **Consider quantifying corpus quality** (token counts, language split, dedup ratio) into
    the manifest summary for dataset-card style reporting.
