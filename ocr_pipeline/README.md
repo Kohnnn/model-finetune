@@ -34,6 +34,50 @@ python ocr_pipeline/process_pdfs.py \
   --extensions .pdf .docx .pptx
 ```
 
+## PageIndex / Vectorless RAG Markdown Export
+
+PageIndex works best when Markdown preserves the report hierarchy with `#`, `##`, and `###` headings. Generate cleaned Markdown reports with:
+
+```bash
+python ocr_pipeline/export_markdown_reports.py \
+  --input-dir raw_dataset \
+  --output-dir ocr_pipeline/markdown_reports \
+  --extensions .pdf .docx .pptx
+```
+
+Pilot run first:
+
+```bash
+python ocr_pipeline/export_markdown_reports.py --limit 5 --sample-mode random --seed 3407
+```
+
+Outputs:
+
+- one `.md` file per retained source report
+- `ocr_pipeline/markdown_reports/manifest.jsonl` with source metadata and output paths
+- `ocr_pipeline/markdown_reports/markdown_failures.log` when files fail
+
+Cleanup behavior:
+
+- strips common contact/disclaimer/analyst-certification tails using the same markers as `process_pdfs.py`
+- removes common VietCap headers and page-number noise
+- preserves natural page/slide sections as `## Page N` instead of chunking for vector search
+
+Optional layout parser:
+
+```bash
+python -m pip install markitdown
+python ocr_pipeline/export_markdown_reports.py --use-markitdown --limit 5
+```
+
+`markitdown` can improve some Office/PDF layout conversion. Scanned/image-only PDFs still need a real OCR step before PageIndex; PageIndex docs recommend their OCR for preserving PDF hierarchy before using Markdown mode.
+
+Index a generated report with self-hosted PageIndex:
+
+```bash
+python run_pageindex.py --md_path D:/finetune/ocr_pipeline/markdown_reports/<report>.md
+```
+
 ## Useful Options
 
 ```bash

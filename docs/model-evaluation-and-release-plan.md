@@ -36,24 +36,25 @@ Each answer is scored on:
 
 ## Release Gates
 
-| Gate | Qwen 3.5 Requirement | Gemma 4 E4B Requirement |
-|------|---------------------|------------------------|
-| **Gate 1: Data Clean** | Clean SFT dataset reviewed | Clean SFT dataset reviewed |
-| **Gate 2: Training Loss** | Final loss < 1.2 | Final loss < 1.2 |
-| **Gate 3: Benchmark Pass** | >= 4/5 queries pass | >= 4/5 queries pass |
-| **Gate 4: Provenance** | GGUF from known HF commit | GGUF from known HF commit |
-| **Gate 5: Fallback Behavior** | No hallucinated fallbacks | No hallucinated fallbacks |
+> **2026-06:** Gemma 4 challenger dropped (see `docs/model-selection-decision.md`).
+> Gates now apply to the single Qwen3.5-4B champion.
 
-## Champion / Challenger Decision
+| Gate | Qwen 3.5 Requirement |
+|------|---------------------|
+| **Gate 1: Data Clean** | Clean SFT dataset reviewed |
+| **Gate 2: Training Loss** | Final loss < 1.2 |
+| **Gate 3: Benchmark Pass** | >= 4/5 queries pass |
+| **Gate 4: Provenance** | GGUF from known HF commit |
+| **Gate 5: Fallback Behavior** | No hallucinated fallbacks |
+
+## Release Decision
 
 After passing all gates:
 
 | Scenario | Decision |
 |----------|----------|
-| Qwen passes, Gemma fails | Deploy Qwen as champion; Gemma work future |
-| Qwen fails, Gemma passes | Deploy Gemma as champion |
-| Both pass | Deploy both; champion = Qwen (existing infra), challenger = Gemma |
-| Both fail | Iterate on data quality before release |
+| Qwen passes all gates | Deploy Qwen as champion |
+| Qwen fails any gate | Iterate on data quality / training before release |
 
 ## Documentation Requirements
 
@@ -74,4 +75,4 @@ After deployment, run weekly benchmark queries:
 python deployment/evaluate_live_query.py --output-path deployment/benchmarks/weekly_report.md
 ```
 
-If champion drops below 4/5 pass rate, trigger Gemma challenger promotion review.
+If champion drops below 4/5 pass rate, trigger a data-quality and retraining review.

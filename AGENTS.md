@@ -1,159 +1,43 @@
-# AGENTS Guide
-Instructions for agentic coding assistants in this repository.
+# AGENTS.md
 
-## Project Context
-- Goal: private AI analyst stack (OCR -> fine-tune -> RAG app -> OCI deployment).
-- State: scaffolded code; key modules contain placeholders.
-- Key paths:
-  - `ocr_pipeline/process_pdfs.py`
-  - `finetune/train.py`
-  - `deployment/app/main.py`
-  - `deployment/docker-compose.yml`
-  - `FINE_TUNING_GUIDE.md`
+## Repo Shape
+- Private AI analyst stack: `raw_dataset/` -> `ocr_pipeline/process_pdfs.py` -> `ocr_pipeline/chroma_chunks.jsonl` and `ocr_pipeline/finetune_template.jsonl` -> Chroma ingestion/RAG app -> optional Unsloth fine-tune -> GGUF deployment.
+- Main entrypoints: OCR `ocr_pipeline/process_pdfs.py`, dataset prep `finetune/prepare_seed_dataset.py`, training `finetune/train.py`, GGUF export `finetune/export_gguf.py`, app `deployment/app/main.py`, ingest `deployment/app/ingest.py`.
+- Generated/private-heavy paths include `raw_dataset/`, `ocr_pipeline/*.jsonl`, `finetune/outputs/`, `deployment/models/`, `deployment/chroma_data/`, `deployment/model_cache/`, and `deployment/.env`; do not commit or inspect more private data than needed.
 
-## Rule Files Check
-No additional rule files were found:
-- `.cursor/rules/`
-- `.cursorrules`
-- `.github/copilot-instructions.md`
-If these appear later, treat them as higher-priority policy.
+## Setup
+- Dependencies are split by stage, not centralized: `python -m pip install -r ocr_pipeline/requirements.txt`, `python -m pip install -r deployment/app/requirements.txt`, and for training first install CUDA PyTorch from `cu128`, then `python -m pip install -r finetune/requirements.txt`.
+- Preferred training setup on this Windows machine is `./finetune/setup_gpu_env.ps1`; docs target Python 3.11, CUDA PyTorch, and a 16GB GPU.
+- Root `package.json` only provides Playwright as a dev dependency; there are no Node app scripts.
 
-## Environment Setup
-Use Python 3.10+ (3.11 preferred).
+## Verification
+- Run all unit tests with `pytest -q`.
+- Run focused tests with `pytest tests/test_process_pdfs.py -q`, `pytest tests/test_train.py -q`, or `pytest tests/test_rag.py -q`.
+- `tests/conftest.py` injects repo root and `deployment/app` into `sys.path`, so app tests import modules as `from rag import ...` rather than package-qualified imports.
+- No committed lint/type config exists; do not invent repo-specific formatter/typecheck requirements unless adding config in the same change.
 
-```bash
-python -m venv .venv
-# Linux/macOS
-source .venv/bin/activate
-# Windows PowerShell
-.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-```
+## OCR Pipeline
+- Install OCR deps before running: `python -m pip install -r ocr_pipeline/requirements.txt`.
+- Standard parse command: `python ocr_pipeline/process_pdfs.py --input-dir raw_dataset --output-dir ocr_pipeline --extensions .pdf .docx .pptx`.
+- PageIndex/vectorless RAG export command: `python ocr_pipeline/export_markdown_reports.py --input-dir raw_dataset --output-dir ocr_pipeline/markdown_reports --extensions .pdf .docx .pptx`; output is generated/private and gitignored.
+- Despite the folder name, parsing is mostly text extraction; scanned/image-only PDFs are a known caveat.
+- Office lock files matching `~$*` are intentionally skipped; failed files go to `ocr_pipeline/parse_failures.log`.
+- `finetune_template.jsonl` contains assistant placeholders and is not meaningful SFT data until completions are filled or a seed dataset is generated.
 
-No pinned dependency file is present; install task-specific dependencies as needed.
+## Fine-Tuning
+- Fast validation only: `python finetune/train.py --dry-run --allow-empty-assistant --max-samples 10`.
+- Build the current draft dataset with `python finetune/prepare_seed_dataset.py --input-path ocr_pipeline/finetune_template.jsonl --output-path finetune/outputs/datasets/qwen35_full_corpus_draft.jsonl --max-rows 1000000 --max-context-words 450`.
+- `train.py` blocks empty assistant-only data unless `--allow-empty-assistant` is set; that flag is for validation, not real training.
+- Current documented full run writes under `finetune/outputs/qwen35_4b_full_corpus_draft23974/`; treat those model artifacts as large/private.
+- Hugging Face upload uses `HF_TOKEN` from the environment; never write it into repo files.
 
-## Build and Run
-Run OCR pipeline:
+## Deployment
+- Required before local stack startup: copy `deployment/.env.example` to `deployment/.env`, set a real `CHROMA_AUTH_TOKEN`, provide `ocr_pipeline/chroma_chunks.jsonl`, and place both `Qwen3.5-4B.Q4_K_M.gguf` and matching `Qwen3.5-4B.BF16-mmproj.gguf` in `deployment/models/`.
+- Recommended smoke command from docs: `python deployment/bootstrap_local.py --ingest-limit 1024`.
+- Current code/config mismatch to check before relying on bootstrap: `bootstrap_local.py` starts compose service `llama`, while `deployment/docker-compose.yml` defines `llama-server` under the `localgguf` profile and `ollama` under the `ollama` profile.
+- Manual compose flow uses `--env-file deployment/.env`: start Chroma/inference, run the `ingest` profile, then start `app`.
+- App endpoints are `GET /healthz` and `POST /query`; live benchmark command is `python deployment/evaluate_live_query.py --output-path deployment/benchmarks/latest_report.md`.
+- The RAG app rejects ungrounded model answers and returns insufficient evidence/fallback excerpts instead of hallucinated text; preserve this behavior when changing prompt or answer parsing code.
 
-```bash
-python ocr_pipeline/process_pdfs.py
-```
-
-Run fine-tuning entrypoint:
-
-```bash
-python finetune/train.py
-```
-
-Run app entrypoint:
-
-```bash
-python deployment/app/main.py
-```
-
-Start stack:
-
-```bash
-docker compose -f deployment/docker-compose.yml up -d
-```
-
-Stop stack:
-
-```bash
-docker compose -f deployment/docker-compose.yml down
-```
-
-## Lint / Format / Types
-No lint/type config files were found (`pyproject.toml`, `ruff.toml`, `mypy.ini`, etc.).
-Use this baseline unless the task adds repo-specific config:
-
-```bash
-ruff check .
-ruff format .
-mypy ocr_pipeline finetune deployment/app
-```
-
-## Testing Commands
-Current state: no `tests/` directory exists.
-When tests are added, use `pytest` and run the narrowest command first.
-
-Run all tests:
-
-```bash
-pytest -q
-```
-
-Run one test file:
-
-```bash
-pytest tests/test_<module>.py -q
-```
-
-Run one test function:
-
-```bash
-pytest tests/test_<module>.py::test_<name> -q
-```
-
-Run tests by keyword:
-
-```bash
-pytest -q -k "keyword"
-```
-
-## Code Style
-
-### Imports
-- Use absolute imports where practical.
-- Group order: standard library, third-party, local modules.
-- Keep imports sorted; remove unused imports.
-- Never use wildcard imports.
-
-### Formatting
-- Follow PEP 8 with Black/Ruff-compatible style (88-char target).
-- Keep functions focused; extract helpers instead of deep nesting.
-- Add comments only for non-obvious reasoning.
-- Keep diffs small and request-scoped.
-
-### Typing
-- Add type hints to all new/changed function signatures.
-- Prefer precise types (`list[str]`) over broad types.
-- Use `TypedDict`/`dataclass` for structured objects when useful.
-- Avoid implicit `None` returns in non-optional APIs.
-
-### Naming
-- `snake_case`: variables, functions, modules.
-- `PascalCase`: classes.
-- `UPPER_SNAKE_CASE`: constants and env vars.
-- Keep domain terms consistent (`chunk`, `context`, `completion`, `adapter`, `gguf`).
-
-### Error Handling
-- Validate inputs early and fail fast.
-- Do not swallow exceptions.
-- Catch specific exception classes, not bare `except`.
-- Provide actionable error context (path/id/operation).
-- Prefer logging in runtime/library code; `print` is fine for script entrypoints.
-
-### Configuration and Secrets
-- Read settings from environment variables.
-- Never hardcode secrets, tokens, or private endpoints.
-- Keep safe local defaults where possible.
-- Document any new env vars in docs or module headers.
-
-### Data and I/O
-- Use UTF-8 text encoding.
-- JSONL outputs must be one JSON object per line.
-- Use deterministic ordering when iterating files.
-- Prefer streaming for large inputs.
-
-## Testing Expectations for Changes
-- Add or update tests for logic changes (create `tests/` if needed).
-- For bug fixes, add a regression test.
-- For integration-heavy changes (OCR/training/docker), pair mocked unit tests with one manual verification command.
-- Before finishing, run at least one relevant command (focused test, lint, or type check).
-
-## Agent Discipline
-- Make minimal targeted edits; avoid unrelated refactors.
-- Do not commit secrets or large generated artifacts unless explicitly requested.
-- If you add tooling config, keep defaults minimal and conventional.
-- In conflicts, follow explicit user instructions first, then this file.
+## Existing Instructions
+- No `.cursor/rules/`, `.cursorrules`, `.github/copilot-instructions.md`, CI workflows, or repo-local `opencode.json` were present when this file was updated.

@@ -1,8 +1,8 @@
 # VietCap Qwen3.5-4B Fine-tuning Development Journal
 
-**Project**: Private AI Analyst Stack (OCR -> Fine-tune -> RAG App -> OCI Deployment)
-**Status**: Phase 2 — VietCap SFT Generation (IN PROGRESS)
-**Last Updated**: 2026-04-04
+**Project**: Private AI Analyst Stack (OCR -> Fine-tune -> RAG App -> Local GGUF Deployment)
+**Status**: v0.1 full-corpus Qwen 3.5 path completed; quality/recovery work remains
+**Last Updated**: 2026-05-16
 
 ---
 
@@ -28,13 +28,33 @@ Phase 1: Opus reasoning fine-tune
     Output: finetune/outputs/qwen35_4b_opus_phase1/merged_model/
     Status: ✅ DONE
 
-Phase 2: VietCap domain fine-tune
-    Step 1: OCR pipeline -> finetune_template.jsonl (6,972 rows)
-    Step 2: SFT generation -> vietcap_sft_generated.jsonl
-    Step 3: Training -> finetune/outputs/qwen35_4b_opus_phase2/merged_model/
-    Step 4: GGUF export -> Ollama serving
-    Status: 🚧 IN PROGRESS
+Phase 2: VietCap/domain full-corpus draft fine-tune
+    Step 1: OCR pipeline -> chroma_chunks.jsonl + finetune_template.jsonl
+    Step 2: Seed dataset -> finetune/outputs/datasets/qwen35_full_corpus_draft.jsonl
+    Step 3: Training -> finetune/outputs/qwen35_4b_full_corpus_draft23974/merged_model/
+    Step 4: GGUF export -> deployment/models/Qwen3.5-4B.Q4_K_M.gguf
+    Status: ✅ v0.1 COMPLETED, but dataset quality and grounded generation need follow-up
 ```
+
+---
+
+## Current Progress Snapshot — 2026-05-16
+
+- OCR outputs currently present: `ocr_pipeline/chroma_chunks.jsonl` and `ocr_pipeline/finetune_template.jsonl`, each with `6,972` rows in the local workspace.
+- Full-corpus draft dataset exists at `finetune/outputs/datasets/qwen35_full_corpus_draft.jsonl` with `23,974` rows.
+- Completed training summary exists at `finetune/outputs/qwen35_4b_full_corpus_draft23974/training_summary.json`.
+- Training run used `unsloth/Qwen3.5-4B`, `23,974` train rows, `eval_rows=0`, `max_seq_length=1024`, `batch_size=1`, `gradient_accumulation=4`, `num_epochs=1`, `lora_r=16`, `lora_alpha=32`.
+- Recorded train runtime was `68,249.5284s` (~18.96h), final `train_loss=1.076507289607723`.
+- Deployment model files are present: `deployment/models/Qwen3.5-4B.Q4_K_M.gguf` and `deployment/models/Qwen3.5-4B.BF16-mmproj.gguf`.
+- Live benchmark report exists at `deployment/benchmarks/latest_report.md`; `/healthz` was `ok`, collection was `research_chunks_v1`, and all three sample ACB queries returned evidence-backed fallback excerpts because the model did not produce grounded cited answers.
+- Current app behavior rejects ungrounded model output and returns insufficient-evidence/fallback evidence instead of generic hallucinated answers.
+
+## Open Follow-Up
+
+- Build a reviewed gold SFT subset; the full-corpus draft is not fully human-reviewed.
+- Improve prompting/serving or model quality so `/query` returns grounded cited answers more often instead of fallback excerpts.
+- Resolve the local deployment mismatch before relying on bootstrap: `deployment/bootstrap_local.py` starts compose service `llama`, but `deployment/docker-compose.yml` defines `llama-server` under the `localgguf` profile and `ollama` under the `ollama` profile.
+- Add a stronger evaluation harness beyond the three-query live benchmark.
 
 ---
 

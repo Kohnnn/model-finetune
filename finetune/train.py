@@ -571,17 +571,18 @@ def verify_model_support(
             trust_remote_code=True,
             token=hub_token,
         )
+        LOGGER.info(
+            "Model config loaded: model_type=%s architectures=%s",
+            getattr(config, "model_type", "unknown"),
+            getattr(config, "architectures", []),
+        )
     except Exception as exc:  # noqa: PERF203
-        raise RuntimeError(
-            f"Could not load model config for {model_name}. Confirm transformers supports "
-            "this model family and that Hugging Face access is available."
-        ) from exc
-
-    LOGGER.info(
-        "Model config loaded: model_type=%s architectures=%s",
-        getattr(config, "model_type", "unknown"),
-        getattr(config, "architectures", []),
-    )
+        LOGGER.warning(
+            "Could not load model config for %s via AutoConfig (transformers may not "
+            "yet support this architecture). Unsloth may still be able to load it directly. Error: %s",
+            model_name,
+            exc,
+        )
     if revision:
         LOGGER.info("Base model commit: %s", revision)
     return revision

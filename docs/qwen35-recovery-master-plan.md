@@ -9,6 +9,14 @@
 | 3 | Stale GGUF provenance | Unknown model lineage | Export fresh from known-good HF artifact |
 | 4 | App fallback masking | Ungrounded analyst-style answers | Detect no-evidence and respond accordingly |
 
+## Current Progress — 2026-05-16
+
+- Completed a v0.1 full-corpus draft Qwen 3.5 run at `finetune/outputs/qwen35_4b_full_corpus_draft23974/` using `23,974` rows and final `train_loss=1.0765`.
+- Exported deployment artifacts are present at `deployment/models/Qwen3.5-4B.Q4_K_M.gguf` and `deployment/models/Qwen3.5-4B.BF16-mmproj.gguf`.
+- Live benchmark exists at `deployment/benchmarks/latest_report.md`; `/healthz` is ok, but sample `/query` results returned fallback evidence snippets because model answers were not grounded/cited.
+- App fallback behavior has been corrected from generic analyst answers to insufficient-evidence/fallback excerpts.
+- Remaining recovery focus is data quality: create or review a clean SFT subset before another training run.
+
 ## Phased Recovery Plan
 
 ### Phase 1: Data Audit and Cleaning

@@ -5,6 +5,7 @@ __pycache__/
 *.pyd
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
 
 # Virtual environments
 .venv/
@@ -19,9 +20,12 @@ raw_dataset/
 ocr_pipeline/chroma_chunks.jsonl
 ocr_pipeline/finetune_template.jsonl
 ocr_pipeline/parse_failures.log
+ocr_pipeline/markdown_reports/
+ocr_pipeline/markdown_reports_samples/
 finetune/outputs/
 
 # Deployment secrets and runtime state
+.env
 deployment/.env
 deployment/models/*
 !deployment/models/.gitkeep
@@ -38,3 +42,5 @@ trace_dill.txt
 trace_ds.txt
 command
 outputs/datasets/vietcap_sft_generated.jsonl
+.env
+.env
