@@ -36,7 +36,7 @@ python finetune/train.py \
   --batch-size 1 \
   --gradient-accumulation 4 \
   --num-epochs 1 \
-  --eval-split 0 \
+  --eval-split 0.1 \
   --log-steps 100 \
   --save-steps 500 \
   --warmup-steps 100 \
@@ -52,6 +52,7 @@ python finetune/train.py \
 python finetune/export_gguf.py \
   --model-path finetune/outputs/qwen35_4b_clean_recovery/merged_model \
   --output-dir finetune/outputs/qwen35_4b_clean_recovery \
+  --run-manifest finetune/outputs/qwen35_4b_clean_recovery/run_manifest.json \
   --gguf-name qwen3_5_4b_clean_recovery
 ```
 

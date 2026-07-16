@@ -41,7 +41,7 @@ def get_settings() -> Settings:
     return Settings(
         host=os.getenv("APP_HOST", "0.0.0.0"),
         port=_read_int("APP_PORT", 8000),
-        llama_api_url=os.getenv("LLAMA_API_URL", "http://llama:8080/v1"),
+        llama_api_url=os.getenv("LLAMA_API_URL", "http://llama-server:8080/v1"),
         chroma_api_url=os.getenv("CHROMA_API_URL", "http://chromadb:8000"),
         chroma_auth_token=os.getenv("CHROMA_AUTH_TOKEN", ""),
         chroma_collection_name=os.getenv(

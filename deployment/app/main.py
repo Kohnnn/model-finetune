@@ -13,9 +13,11 @@ from embeddings import get_embedding_model
 from prompts import build_query_messages
 from rag import (
     answer_is_grounded,
-    build_context_block,
+    answer_is_refusal,
+    build_context,
     build_fallback_answer,
     build_source_records,
+    model_is_available,
     parse_chroma_results,
 )
 from schemas import HealthResponse, QueryRequest, QueryResponse
@@ -62,10 +64,28 @@ class RAGService:
 
     def has_collection(self) -> bool:
         try:
-            self.chroma_client.get_collection(name=self.settings.chroma_collection_name)
+            collection = self.chroma_client.get_collection(
+                name=self.settings.chroma_collection_name
+            )
+            if collection.count() < 1:
+                return False
+            embedding = self.embedding_model.encode_query("health check")
+            collection.query(
+                query_embeddings=[embedding],
+                n_results=1,
+                include=["distances"],
+            )
         except Exception:  # noqa: PERF203
             return False
         return True
+
+    def has_inference(self) -> bool:
+        try:
+            models = self.llm_client.models.list()
+            model_ids = {str(model.id) for model in models.data}
+        except Exception:  # noqa: PERF203
+            return False
+        return model_is_available(model_ids, self.settings.llm_model_name)
 
     def get_collection(self):
         try:
@@ -87,13 +107,13 @@ class RAGService:
         )
         return parse_chroma_results(results)
 
-    def generate_answer(self, query: str, chunks: list) -> str:
-        context_block = build_context_block(
+    def generate_answer(self, query: str, chunks: list) -> tuple[str, str, int]:
+        context_block, context_used = build_context(
             chunks,
             max_context_chars=self.settings.max_context_chars,
         )
         if not context_block:
-            return INSUFFICIENT_EVIDENCE_ANSWER
+            return INSUFFICIENT_EVIDENCE_ANSWER, "insufficient_evidence", 0
 
         response = self.llm_client.chat.completions.create(
             model=self.settings.llm_model_name,
@@ -103,14 +123,18 @@ class RAGService:
         )
         message = response.choices[0].message.content
         if not message:
-            return INSUFFICIENT_EVIDENCE_ANSWER
+            return INSUFFICIENT_EVIDENCE_ANSWER, "insufficient_evidence", context_used
         answer = message.strip()
-        if not answer_is_grounded(answer):
-            LOGGER.warning(
-                "Model returned ungrounded answer; returning insufficient evidence"
+        if answer_is_refusal(answer):
+            return INSUFFICIENT_EVIDENCE_ANSWER, "insufficient_evidence", context_used
+        if not answer_is_grounded(answer, context_used):
+            LOGGER.warning("Model returned an ungrounded answer; returning evidence excerpts")
+            return (
+                build_fallback_answer(chunks[:context_used]),
+                "evidence_fallback",
+                context_used,
             )
-            return INSUFFICIENT_EVIDENCE_ANSWER
-        return answer
+        return answer, "model", context_used
 
 
 @lru_cache
@@ -125,10 +149,13 @@ app = FastAPI(title="Private Analyst RAG API", version="0.1.0")
 @app.get("/healthz", response_model=HealthResponse)
 def healthz() -> HealthResponse:
     service = get_service()
+    collection_available = service.has_collection()
+    inference_available = service.has_inference()
     return HealthResponse(
-        status="ok",
+        status="ok" if collection_available and inference_available else "degraded",
         collection_name=settings.chroma_collection_name,
-        collection_available=service.has_collection(),
+        collection_available=collection_available,
+        inference_available=inference_available,
         embedding_model_name=settings.embedding_model_name,
         llm_model_name=settings.llm_model_name,
     )
@@ -150,21 +177,23 @@ def query(request: QueryRequest) -> QueryResponse:
     if not chunks:
         return QueryResponse(
             answer=INSUFFICIENT_EVIDENCE_ANSWER,
+            answer_mode="insufficient_evidence",
             sources=[],
             context_used=0,
             collection_name=settings.chroma_collection_name,
         )
 
     try:
-        answer = service.generate_answer(request.query, chunks)
+        answer, answer_mode, context_used = service.generate_answer(request.query, chunks)
     except Exception as exc:  # noqa: PERF203
         LOGGER.exception("Generation failed")
         raise HTTPException(status_code=502, detail="Generation failed") from exc
 
     return QueryResponse(
         answer=answer,
-        sources=build_source_records(chunks),
-        context_used=len(chunks),
+        answer_mode=answer_mode,
+        sources=build_source_records(chunks[:context_used]),
+        context_used=context_used,
         collection_name=settings.chroma_collection_name,
     )
 

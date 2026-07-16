@@ -26,6 +26,7 @@ class QueryResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     answer: str
+    answer_mode: str
     sources: list[SourceChunk]
     context_used: int
     collection_name: str
@@ -37,5 +38,6 @@ class HealthResponse(BaseModel):
     status: str
     collection_name: str
     collection_available: bool
+    inference_available: bool
     embedding_model_name: str
     llm_model_name: str

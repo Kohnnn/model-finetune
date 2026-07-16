@@ -5,7 +5,11 @@ import re
 from typing import Any
 
 
-CITATION_PATTERN = re.compile(r"\[S\d+\]")
+CITATION_PATTERN = re.compile(r"\[S(\d+)\]")
+REFUSAL_PATTERN = re.compile(
+    r"(?:insufficient|not enough|do not have enough|don't have enough|could not find sufficient|cannot answer|unable to answer|lack sufficient).{0,80}(?:evidence|context|information)|(?:evidence|context|information).{0,80}(?:insufficient|not enough)|(?:không|chưa).{0,30}đủ.{0,30}(?:bằng chứng|thông tin|ngữ cảnh)",
+    re.IGNORECASE | re.DOTALL,
+)
 CODE_DUMP_PATTERN = re.compile(
     r"(?:^|\n)(?:import\s+\w+|from\s+\w+\s+import|/[\w.-]+/[\w./-]+)"
 )
@@ -17,6 +21,12 @@ class RetrievedChunk:
     text: str
     metadata: dict[str, Any]
     distance: float | None = None
+
+
+def model_is_available(model_ids: set[str], expected: str) -> bool:
+    return expected in model_ids or (
+        ":" not in expected and f"{expected}:latest" in model_ids
+    )
 
 
 def prepare_passage_text(text: str) -> str:
@@ -58,9 +68,11 @@ def parse_chroma_results(results: dict[str, list[list[Any]]]) -> list[RetrievedC
     return chunks
 
 
-def build_context_block(chunks: list[RetrievedChunk], max_context_chars: int) -> str:
+def build_context(
+    chunks: list[RetrievedChunk], max_context_chars: int
+) -> tuple[str, int]:
     if max_context_chars <= 0:
-        return ""
+        return "", 0
 
     sections: list[str] = []
     current_length = 0
@@ -85,7 +97,11 @@ def build_context_block(chunks: list[RetrievedChunk], max_context_chars: int) ->
         sections.append(section)
         current_length += len(section) + 2
 
-    return "\n\n".join(sections)
+    return "\n\n".join(sections), len(sections)
+
+
+def build_context_block(chunks: list[RetrievedChunk], max_context_chars: int) -> str:
+    return build_context(chunks, max_context_chars)[0]
 
 
 def build_source_records(chunks: list[RetrievedChunk]) -> list[dict[str, Any]]:
@@ -107,15 +123,20 @@ def build_source_records(chunks: list[RetrievedChunk]) -> list[dict[str, Any]]:
     return sources
 
 
-def answer_is_grounded(answer: str) -> bool:
+def answer_is_grounded(answer: str, source_count: int) -> bool:
     normalized = answer.strip()
-    if not normalized:
+    if not normalized or source_count < 1:
         return False
-    if not CITATION_PATTERN.search(normalized):
+    citations = [int(match) for match in CITATION_PATTERN.findall(normalized)]
+    if not citations or any(index < 1 or index > source_count for index in citations):
         return False
     if CODE_DUMP_PATTERN.search(normalized[:1200]):
         return False
     return True
+
+
+def answer_is_refusal(answer: str) -> bool:
+    return bool(REFUSAL_PATTERN.search(answer.strip()))
 
 
 def build_fallback_answer(chunks: list[RetrievedChunk], max_sources: int = 3) -> str:

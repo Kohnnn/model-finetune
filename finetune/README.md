@@ -1,160 +1,104 @@
 # Fine-Tuning Pipeline
 
-This folder contains the Windows GPU Qwen 3.5/4B training path and supporting dataset-prep utilities.
+This folder contains the Windows GPU Qwen3.5-4B training, export, release validation, and private Hugging Face publication path.
 
-## Purpose
+## Canonical workflow
 
-Use this stage only after the retrieval system is working. RAG should carry factual knowledge first; fine-tuning should refine analyst tone, structure, and response style.
+Follow [`../docs/fine-tuning-visual-journal.md`](../docs/fine-tuning-visual-journal.md). It is the maintained source for commands and beginner explanations.
 
-## Install
-
-Recommended on this machine:
+## Environment
 
 ```powershell
 ./finetune/setup_gpu_env.ps1
 ```
 
-Manual equivalent:
-
-```powershell
-python -m venv .venv
-.venv\Scripts\python.exe -m pip install --upgrade pip
-.venv\Scripts\python.exe -m pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
-.venv\Scripts\python.exe -m pip install -r finetune/requirements.txt
-.venv\Scripts\python.exe -m pip install --upgrade "git+https://github.com/unslothai/unsloth.git" "git+https://github.com/unslothai/unsloth-zoo.git"
-```
-
-Recommended runtime:
+Target runtime:
 
 - Python 3.11
-- RTX 4060 Ti 16GB or better
-- CUDA-enabled PyTorch from the `cu128` wheel index
+- RTX 4060 Ti 16 GB or better
+- CUDA PyTorch from the `cu128` wheel index
+- bf16 support
 
-Current local status:
+## Data contract
 
-- Cleaned full-corpus draft dataset generated at `finetune/outputs/datasets/qwen35_full_corpus_draft.jsonl`
-- Successful full Qwen 3.5 adapter generated at `finetune/outputs/qwen35_4b_full_corpus_draft23974/adapter`
-- Successful merged Qwen 3.5 artifact generated at `finetune/outputs/qwen35_4b_full_corpus_draft23974/merged_model`
-- Successful GGUF export generated at `finetune/outputs/qwen35_4b_full_corpus_draft23974/gguf/qwen3_5_4b_private_analyst_full_corpus_q4_k_m_gguf/Qwen3.5-4B.Q4_K_M.gguf`
-- Full-run summary generated at `finetune/outputs/qwen35_4b_full_corpus_draft23974/training_summary.json`
-- Private Hugging Face repo uploaded at `Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
-- Private Hugging Face URL: `https://huggingface.co/Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
+Production rows must contain:
 
-## Dataset Requirement
+- chat-style `messages` with a non-empty assistant response;
+- `metadata.doc_id` for source-document grouping;
+- `metadata.review_status` equal to `approved` after human review.
 
-Default dataset path:
+`prepare_seed_dataset.py` creates review candidates marked `draft`. The trainer does not accept them.
 
-- `ocr_pipeline/finetune_template.jsonl`
+Safe parser-template validation:
 
-Important:
-
-- the template file is not training-ready until assistant completions are filled
-- `train.py` blocks empty assistant-only datasets unless `--allow-empty-assistant` is used
-- using `--allow-empty-assistant` is only useful for validation, not real training
-- `prepare_seed_dataset.py` can create a synthetic bootstrap dataset when you need a local seed run
-
-## Usage
-
-Inspect options:
-
-```bash
-python finetune/train.py --help
+```powershell
+.venv\Scripts\python.exe finetune/train.py --dry-run --allow-empty-assistant --max-samples 10
 ```
 
-Dry-run validation:
+Approved-data validation:
 
-```bash
-python finetune/train.py --dry-run --allow-empty-assistant --max-samples 10
+```powershell
+.venv\Scripts\python.exe finetune/train.py `
+  --dry-run `
+  --dataset-path finetune/outputs/datasets/qwen35_approved_sft.jsonl
 ```
 
-Example smoke training command after labeling:
+## Training contract
 
-```bash
-python finetune/train.py \
-  --dataset-path ocr_pipeline/finetune_template.jsonl \
-  --max-samples 128 \
-  --num-epochs 0.2 \
+`train.py` enforces:
+
+- a clean committed worktree for production runs;
+- deterministic seed and document-level train/eval split;
+- Qwen3.5-4B bf16 LoRA loading;
+- assistant-only loss masking;
+- baseline and final evaluation loss;
+- checkpoint saving and `--resume-from-checkpoint True`;
+- immutable base-model revision and dataset SHA-256 in `run_manifest.json`.
+
+Smoke first:
+
+```powershell
+.venv\Scripts\python.exe finetune/train.py `
+  --dataset-path finetune/outputs/datasets/qwen35_approved_sft.jsonl `
+  --output-dir finetune/outputs/qwen35_4b_approved_smoke `
+  --max-samples 64 `
+  --num-epochs 0.1 `
   --skip-gguf-export
 ```
 
-Full-corpus draft dataset generation:
+## GGUF export
 
-```bash
-python finetune/prepare_seed_dataset.py \
-  --input-path ocr_pipeline/finetune_template.jsonl \
-  --output-path finetune/outputs/datasets/qwen35_full_corpus_draft.jsonl \
-  --max-rows 1000000 \
-  --max-context-words 450
+```powershell
+.venv\Scripts\python.exe finetune/export_gguf.py `
+  --model-path finetune/outputs/qwen35_4b_approved_v1/merged_model `
+  --output-dir finetune/outputs/qwen35_4b_approved_v1 `
+  --run-manifest finetune/outputs/qwen35_4b_approved_v1/run_manifest.json `
+  --gguf-name qwen3_5_4b_private_analyst_v1
 ```
 
-Qwen 3.5/4B full-corpus run completed on this machine:
+The exporter writes SHA-256 checksums. Keep the Q4_K_M model and matching bf16 mmproj together.
 
-```bash
-python finetune/train.py \
-  --dataset-path finetune/outputs/datasets/qwen35_full_corpus_draft.jsonl \
-  --output-dir finetune/outputs/qwen35_4b_full_corpus_draft23974 \
-  --max-seq-length 1024 \
-  --batch-size 1 \
-  --gradient-accumulation 4 \
-  --num-epochs 1 \
-  --eval-split 0 \
-  --log-steps 100 \
-  --save-steps 500 \
-  --warmup-steps 100 \
-  --save-merged-model \
-  --skip-gguf-export \
-  --disable-response-only-masking
+## Release validation
+
+```powershell
+.venv\Scripts\python.exe finetune/validate_release.py `
+  --run-dir finetune/outputs/qwen35_4b_approved_v1 `
+  --benchmark-json deployment/benchmarks/candidate.json
 ```
 
-Hugging Face upload helper:
+A passed release includes `release_manifest.json`, `SHA256SUMS`, a model card, a metadata-only dataset card, and sanitized run and benchmark summaries. Raw benchmark answers, local paths, and document IDs are not uploaded.
 
-```bash
-python finetune/push_to_huggingface.py \
-  --model-dir finetune/outputs/qwen35_4b_full_corpus_draft23974/merged_model \
-  --repo-id Mikkkkoooo/qwen35-4b-private-analyst-full-corpus \
-  --private
+## Private Hugging Face upload
+
+```powershell
+.venv\Scripts\python.exe finetune/push_to_huggingface.py `
+  --run-dir finetune/outputs/qwen35_4b_approved_v1 `
+  --release-manifest finetune/outputs/qwen35_4b_approved_v1/release_manifest.json `
+  --repo-id YOUR_ACCOUNT/private-analyst-qwen35-v1
 ```
 
-GGUF export helper:
+The helper requires `HF_TOKEN`, verifies private visibility before upload, publishes only the exact hashed inventory, and verifies remote bytes. Never commit the token, corpus, generated dataset, model weights, or release benchmark answers containing private excerpts.
 
-```bash
-python finetune/export_gguf.py \
-  --model-path finetune/outputs/qwen35_4b_full_corpus_draft23974/adapter \
-  --output-dir finetune/outputs/qwen35_4b_full_corpus_draft23974 \
-  --gguf-name qwen3_5_4b_private_analyst_full_corpus_q4_k_m
-```
+## Historical evidence
 
-Current artifact sizes on this machine:
-
-- Qwen 3.5 full adapter: about `0.10 GB`
-- Qwen 3.5 full merged model: about `8.70 GB`
-- Qwen 3.5 GGUF export directory: about `3.15 GB`
-
-## Outputs
-
-Training artifacts are written under `finetune/outputs/`:
-
-- `checkpoints/`
-- `adapter/`
-- `gguf/`
-- `datasets/`
-- `qwen35_4b_full_corpus_draft23974/`
-
-## Recommended Workflow
-
-1. validate the RAG MVP first
-2. generate the `qwen35_full_corpus_draft.jsonl` draft set
-3. manually review the highest-value rows if you want a higher-quality follow-up run
-4. run the Qwen 3.5 4B training command on the reviewed or full-corpus file
-5. save adapter + merged Hugging Face artifact
-6. export GGUF for deployment when you are happy with the model
-
-## Notes
-
-- current deployment is model-agnostic as long as `LLAMA_MODEL_FILENAME` matches the GGUF you provide
-- if you change model family or quantization, update `deployment/.env`
-- `FINE_TUNING_GUIDE.md` provides the higher-level workflow narrative
-- `QWEN35_TRAINING_NOTES.md` captures the full troubleshooting and execution path used here
-- `HF_TOKEN` is expected to be stored locally in the user environment, not committed to the repo
-- the current Hugging Face repo is private because the source corpus is private
-- the current GGUF export includes the quantized model and the mmproj companion file required by this Qwen 3.5 stack
+`QWEN35_TRAINING_NOTES.md` records the earlier draft-data run and troubleshooting. Its full-sequence training command is historical, not the current release path.

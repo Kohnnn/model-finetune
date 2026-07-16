@@ -13,14 +13,22 @@ Key links:
 - GitHub model mirror: `https://github.com/Kohnnn/model-finetune`
 - Hugging Face model: `https://huggingface.co/Mikkkkoooo/qwen35-4b-private-analyst-full-corpus`
 
-## Snapshot
+## Start Here
+
+- Canonical beginner course: [`docs/fine-tuning-visual-journal.md`](docs/fine-tuning-visual-journal.md)
+- Interactive tutorial: [`notebooks/private_analyst_fine_tuning_tutorial.ipynb`](notebooks/private_analyst_fine_tuning_tutorial.ipynb)
+- Historical engineering record: [`DEVELOPMENT_JOURNAL.md`](DEVELOPMENT_JOURNAL.md)
+
+## Historical v0.1 Snapshot
+
+This draft-data run is engineering evidence, not a release-quality training recipe.
 
 - parse result: `8179/8180` supported files processed
 - cleaned chunks: `23978`
-- full-corpus training rows: `23974`
+- draft training rows: `23974`
 - final train loss: `1.0765`
-- final model folder: `finetune/outputs/qwen35_4b_full_corpus_draft23974`
-- deployment model: `deployment/models/Qwen3.5-4B.Q4_K_M.gguf`
+- historical model folder: `finetune/outputs/qwen35_4b_full_corpus_draft23974`
+- historical deployment model: `deployment/models/Qwen3.5-4B.Q4_K_M.gguf`
 
 ## Architecture
 
@@ -188,61 +196,28 @@ python deployment/evaluate_live_query.py --output-path deployment/benchmarks/lat
 
 ## Fine-Tuning Workflow
 
-### GPU environment
+The release path accepts only human-reviewed rows with `metadata.review_status=approved` and `metadata.doc_id`. It uses a document-level evaluation split, bf16 LoRA, assistant-only loss, baseline/final evaluation, manifests, hashes, and enforced release gates.
 
 ```powershell
 ./finetune/setup_gpu_env.ps1
+.venv\Scripts\python.exe finetune/train.py --dry-run --dataset-path finetune/outputs/datasets/qwen35_approved_sft.jsonl
 ```
 
-### Build the full-corpus draft dataset
-
-```bash
-python finetune/prepare_seed_dataset.py \
-  --input-path ocr_pipeline/finetune_template.jsonl \
-  --output-path finetune/outputs/datasets/qwen35_full_corpus_draft.jsonl \
-  --max-rows 1000000 \
-  --max-context-words 450
-```
-
-### Train the full-corpus Qwen 3.5 model
-
-```bash
-python finetune/train.py \
-  --dataset-path finetune/outputs/datasets/qwen35_full_corpus_draft.jsonl \
-  --output-dir finetune/outputs/qwen35_4b_full_corpus_draft23974 \
-  --max-seq-length 1024 \
-  --batch-size 1 \
-  --gradient-accumulation 4 \
-  --num-epochs 1 \
-  --eval-split 0 \
-  --log-steps 100 \
-  --save-steps 500 \
-  --warmup-steps 100 \
-  --save-merged-model \
-  --skip-gguf-export \
-  --disable-response-only-masking
-```
-
-### Export GGUF
-
-```bash
-python finetune/export_gguf.py \
-  --model-path finetune/outputs/qwen35_4b_full_corpus_draft23974/adapter \
-  --output-dir finetune/outputs/qwen35_4b_full_corpus_draft23974 \
-  --gguf-name qwen3_5_4b_private_analyst_full_corpus_q4_k_m
-```
+Continue with the exact smoke, training, evaluation, export, validation, publication, and deployment commands in [`docs/fine-tuning-visual-journal.md`](docs/fine-tuning-visual-journal.md).
 
 ## Release Checklist
 
 - rerun parse and review `ocr_pipeline/parse_failures.log`
 - regenerate the SFT dataset
-- train and save `training_summary.json`
-- export merged HF and GGUF artifacts
-- copy new `.gguf` and `mmproj` into `deployment/models/`
+- human-review rows and mark only accepted examples `approved`
+- validate the document split, assistant-only loss, baseline, and final metrics in `run_manifest.json`
+- export merged HF, GGUF, matching mmproj, and SHA-256 artifacts
+- compare baseline and candidate with `deployment/evaluate_live_query.py`
+- pass `finetune/validate_release.py`
+- copy both GGUF files and `SHA256SUMS` into `deployment/models/`
 - run `python deployment/bootstrap_local.py --ingest-limit 1024`
-- verify `/healthz`, `/query`, and `deployment/evaluate_live_query.py`
-- update README, journal, release notes, and model card
-- push GitHub commits and upload the HF model
+- verify `/healthz`, `/query`, and answer modes
+- upload only through the private, release-manifest-gated Hub helper
 
 ## Roadmap
 
@@ -337,7 +312,9 @@ All visual guides by [Maarten Grootendorst](https://substack.com/@maartengrooten
 - `ocr_pipeline/README.md` - parser details and output schema
 - `finetune/README.md` - training workflow and artifact layout
 - `finetune/QWEN35_TRAINING_NOTES.md` - detailed Qwen 3.5 troubleshooting log
-- `FINE_TUNING_GUIDE.md` - higher-level fine-tuning guide
+- `docs/fine-tuning-visual-journal.md` - canonical beginner fine-tuning and release course
+- `notebooks/private_analyst_fine_tuning_tutorial.ipynb` - safe interactive tutorial
+- `FINE_TUNING_GUIDE.md` - legacy pointer to the canonical course
 
 ## Privacy Notes
 

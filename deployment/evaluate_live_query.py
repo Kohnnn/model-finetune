@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -33,6 +34,23 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional path to write a Markdown report.",
+    )
+    parser.add_argument(
+        "--json-output-path",
+        type=Path,
+        default=None,
+        help="Optional path to write machine-readable benchmark results.",
+    )
+    parser.add_argument(
+        "--label",
+        default="candidate",
+        help="Run label written to reports, such as baseline or candidate.",
+    )
+    parser.add_argument(
+        "--baseline-json",
+        type=Path,
+        default=None,
+        help="Optional prior benchmark JSON used for baseline-versus-candidate comparison.",
     )
     parser.add_argument(
         "--timeout-seconds",
@@ -71,6 +89,32 @@ def keyword_hits(answer: str, expected_keywords: list[str]) -> list[str]:
     return [keyword for keyword in expected_keywords if keyword.casefold() in lowered]
 
 
+def score_result(
+    item: dict[str, Any],
+    answer: str,
+    answer_mode: str,
+    hits: list[str],
+    source_count: int,
+) -> tuple[bool, str]:
+    expected_mode = str(item.get("expected_mode", "model"))
+    if expected_mode == "refusal":
+        passed = answer_mode == "insufficient_evidence"
+        return passed, "safe refusal" if passed else "expected safe refusal"
+
+    minimum_hits = int(item.get("minimum_keyword_hits", 1))
+    citations = [int(index) for index in re.findall(r"\[S(\d+)\]", answer)]
+    has_valid_citation = bool(citations) and all(
+        1 <= index <= source_count for index in citations
+    )
+    passed = answer_mode == "model" and has_valid_citation and len(hits) >= minimum_hits
+    reason = (
+        "grounded model answer"
+        if passed
+        else "requires cited model answer and expected keyword coverage"
+    )
+    return passed, reason
+
+
 def evaluate_questions(
     *,
     base_url: str,
@@ -90,18 +134,26 @@ def evaluate_questions(
         elapsed = time.perf_counter() - start
 
         answer = str(response.get("answer", ""))
+        answer_mode = str(response.get("answer_mode", "unknown"))
         sources = response.get("sources", []) or []
         hits = keyword_hits(answer, expected_keywords)
+        passed, reason = score_result(
+            item, answer, answer_mode, hits, source_count=len(sources)
+        )
 
         results.append(
             {
                 "id": item.get("id") or question[:40],
                 "question": question,
+                "expected_mode": item.get("expected_mode", "model"),
                 "elapsed_seconds": round(elapsed, 2),
                 "context_used": response.get("context_used", 0),
                 "source_count": len(sources),
+                "answer_mode": answer_mode,
                 "expected_keywords": expected_keywords,
                 "keyword_hits": hits,
+                "passed": passed,
+                "reason": reason,
                 "answer": answer,
                 "source_labels": [source.get("source_label") for source in sources[:3]],
             }
@@ -109,28 +161,98 @@ def evaluate_questions(
     return results
 
 
+def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+    refusal_results = [
+        result for result in results if result["expected_mode"] == "refusal"
+    ]
+    return {
+        "passed": sum(bool(result["passed"]) for result in results),
+        "total": len(results),
+        "fallback_safe": bool(refusal_results)
+        and all(bool(result["passed"]) for result in refusal_results),
+        "model_answers": sum(result["answer_mode"] == "model" for result in results),
+        "evidence_fallbacks": sum(
+            result["answer_mode"] == "evidence_fallback" for result in results
+        ),
+    }
+
+
+def compare_summaries(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    candidate_results: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    baseline_summary = baseline.get("summary") or {}
+    baseline_results = baseline.get("results") or []
+    candidate_results = candidate_results or []
+    baseline_ids = {str(result.get("id")) for result in baseline_results}
+    candidate_ids = {str(result.get("id")) for result in candidate_results}
+    baseline_passed_ids = {
+        str(result.get("id")) for result in baseline_results if result.get("passed") is True
+    }
+    candidate_passed_ids = {
+        str(result.get("id")) for result in candidate_results if result.get("passed") is True
+    }
+    question_set_matches = bool(baseline_ids) and baseline_ids == candidate_ids
+    regressed_ids = sorted(baseline_passed_ids - candidate_passed_ids)
+    baseline_passed = int(baseline_summary.get("passed", 0))
+    candidate_passed = int(candidate.get("passed", 0))
+    return {
+        "baseline_passed": baseline_passed,
+        "candidate_passed": candidate_passed,
+        "pass_delta": candidate_passed - baseline_passed,
+        "question_set_matches": question_set_matches,
+        "regressed_ids": regressed_ids,
+        "regressed": candidate_passed < baseline_passed
+        or bool(regressed_ids)
+        or not question_set_matches,
+    }
+
+
 def render_markdown(
-    base_url: str, health: dict[str, Any], results: list[dict[str, Any]]
+    base_url: str,
+    label: str,
+    health: dict[str, Any],
+    results: list[dict[str, Any]],
+    comparison: dict[str, Any] | None = None,
 ) -> str:
+    summary = summarize_results(results)
     lines = [
         "# Live Query Benchmark",
         "",
+        f"- Label: `{label}`",
         f"- Base URL: `{base_url}`",
         f"- Status: `{health.get('status')}`",
         f"- Collection: `{health.get('collection_name')}`",
         f"- Embedding model: `{health.get('embedding_model_name')}`",
         f"- LLM model: `{health.get('llm_model_name')}`",
-        "",
-        "## Results",
-        "",
-        "| ID | Seconds | Context | Sources | Keyword hits |",
-        "| --- | ---: | ---: | ---: | --- |",
+        f"- Passed: `{summary['passed']}/{summary['total']}`",
+        f"- Fallback safety: `{summary['fallback_safe']}`",
     ]
+    if comparison is not None:
+        lines.extend(
+            [
+                f"- Baseline passed: `{comparison['baseline_passed']}`",
+                f"- Pass delta: `{comparison['pass_delta']}`",
+                f"- Regressed: `{comparison['regressed']}`",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "## Results",
+            "",
+            "| ID | Pass | Mode | Seconds | Context | Sources | Keyword hits |",
+            "| --- | --- | --- | ---: | ---: | ---: | --- |",
+        ]
+    )
 
     for result in results:
         lines.append(
-            "| {id} | {elapsed_seconds} | {context_used} | {source_count} | {hits} |".format(
+            "| {id} | {passed} | {mode} | {elapsed_seconds} | {context_used} | {source_count} | {hits} |".format(
                 id=result["id"],
+                passed="yes" if result["passed"] else "no",
+                mode=result["answer_mode"],
                 elapsed_seconds=result["elapsed_seconds"],
                 context_used=result["context_used"],
                 source_count=result["source_count"],
@@ -146,6 +268,9 @@ def render_markdown(
                 "",
                 f"- Question: `{result['question']}`",
                 f"- Runtime: `{result['elapsed_seconds']}s`",
+                f"- Passed: `{result['passed']}`",
+                f"- Answer mode: `{result['answer_mode']}`",
+                f"- Reason: `{result['reason']}`",
                 f"- Context used: `{result['context_used']}`",
                 f"- Sources: `{', '.join([x for x in result['source_labels'] if x]) or '-'}`",
                 f"- Keyword hits: `{', '.join(result['keyword_hits']) or '-'}`",
@@ -171,7 +296,23 @@ def main() -> int:
             questions=questions,
             timeout_seconds=args.timeout_seconds,
         )
-        report = render_markdown(args.base_url, health, results)
+        summary = summarize_results(results)
+        comparison = None
+        if args.baseline_json is not None:
+            baseline = json.loads(args.baseline_json.read_text(encoding="utf-8"))
+            comparison = compare_summaries(baseline, summary, results)
+        report = render_markdown(
+            args.base_url, args.label, health, results, comparison=comparison
+        )
+        payload = {
+            "schema_version": 1,
+            "label": args.label,
+            "base_url": args.base_url,
+            "health": health,
+            "summary": summary,
+            "comparison": comparison,
+            "results": results,
+        }
 
         if args.output_path is not None:
             args.output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -181,7 +322,16 @@ def main() -> int:
             sys.stdout.buffer.write(report.encode("utf-8", errors="replace"))
             sys.stdout.buffer.write(b"\n")
 
-        return 0
+        if args.json_output_path is not None:
+            args.json_output_path.parent.mkdir(parents=True, exist_ok=True)
+            args.json_output_path.write_text(
+                json.dumps(payload, indent=2), encoding="utf-8"
+            )
+            print(f"Benchmark JSON written to {args.json_output_path}")
+
+        passed_threshold = summary["passed"] >= 4 and summary["fallback_safe"]
+        regressed = comparison is not None and comparison["regressed"]
+        return 0 if passed_threshold and not regressed else 2
     except (FileNotFoundError, RuntimeError, HTTPError, URLError) as exc:
         print(str(exc), file=sys.stderr)
         return 1

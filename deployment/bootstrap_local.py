@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -26,7 +27,7 @@ def parse_args() -> argparse.Namespace:
         default="localgguf",
         help=(
             "Inference backend to start. 'localgguf' runs the llama.cpp server from a "
-            "local GGUF file (default); 'ollama' pulls the model from Hugging Face."
+            "local GGUF file (default); 'ollama' uses a preinstalled Ollama model."
         ),
     )
     parser.add_argument(
@@ -81,6 +82,33 @@ def require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file_handle:
+        for block in iter(lambda: file_handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def read_sha256sums(path: Path) -> dict[str, str]:
+    require(path.exists(), f"Checksum file not found: {path}")
+    checksums: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        parts = raw_line.strip().split(maxsplit=1)
+        if len(parts) == 2:
+            checksums[Path(parts[1].lstrip("* ")).name] = parts[0]
+    return checksums
+
+
+def verify_model_checksum(model_path: Path, checksums: dict[str, str]) -> None:
+    expected = checksums.get(model_path.name)
+    require(expected is not None, f"No SHA-256 entry for {model_path.name}")
+    require(
+        sha256_file(model_path) == expected,
+        f"SHA-256 mismatch for {model_path}",
+    )
+
+
 def validate_inputs(env_values: dict[str, str], with_proxy: bool, inference: str) -> None:
     chroma_token = env_values.get("CHROMA_AUTH_TOKEN", "")
     require(
@@ -91,22 +119,37 @@ def validate_inputs(env_values: dict[str, str], with_proxy: bool, inference: str
     if inference == "localgguf":
         # docker-compose 'llama-server' reads MODEL=/models/${LLM_MODEL:-...};
         # keep this default in sync with docker-compose.yml.
-        model_filename = env_values.get("LLM_MODEL", "Qwen3.5-4B.Clean-Recovery.Q4_K_M.gguf")
+        model_filename = env_values.get(
+            "LLM_MODEL", "Qwen3.5-4B.Clean-Recovery.Q4_K_M.gguf"
+        ).strip()
+        require(bool(model_filename), "Set LLM_MODEL to a GGUF file name.")
         model_path = DEPLOYMENT_DIR / "models" / model_filename
         require(
-            model_path.exists(),
+            model_path.is_file(),
             f"Model file not found: {model_path}. Place your GGUF model in deployment/models "
             "or set LLM_MODEL in deployment/.env.",
         )
 
-        mmproj_filename = env_values.get("LLAMA_MMPROJ_FILENAME", "").strip()
-        if mmproj_filename:
-            mmproj_path = DEPLOYMENT_DIR / "models" / mmproj_filename
-            require(
-                mmproj_path.exists(),
-                f"mmproj file not found: {mmproj_path}. Place the exported mmproj file in "
-                "deployment/models or unset LLAMA_MMPROJ_FILENAME.",
-            )
+        mmproj_filename = env_values.get(
+            "LLAMA_MMPROJ_FILENAME", "Qwen3.5-4B.BF16-mmproj.gguf"
+        ).strip()
+        require(
+            bool(mmproj_filename),
+            "Set LLAMA_MMPROJ_FILENAME for the Qwen3.5 deployment bundle.",
+        )
+        mmproj_path = DEPLOYMENT_DIR / "models" / mmproj_filename
+        require(
+            mmproj_path.is_file(),
+            f"mmproj file not found: {mmproj_path}. Place the matching exported mmproj file in deployment/models.",
+        )
+        checksums = read_sha256sums(DEPLOYMENT_DIR / "models" / "SHA256SUMS")
+        verify_model_checksum(model_path, checksums)
+        verify_model_checksum(mmproj_path, checksums)
+    else:
+        require(
+            bool(env_values.get("OLLAMA_MODEL", "").strip()),
+            "Set OLLAMA_MODEL in deployment/.env to a model already installed in Ollama.",
+        )
 
     dataset_path = REPO_ROOT / "ocr_pipeline" / "chroma_chunks.jsonl"
     require(
@@ -158,6 +201,38 @@ def run_compose_with_retries(
         raise last_error
 
 
+def verify_ollama_model(
+    model_name: str, retries: int = 12, delay_seconds: int = 5
+) -> None:
+    command = [
+        "docker",
+        "compose",
+        "-f",
+        str(COMPOSE_FILE),
+        "--env-file",
+        str(ENV_PATH),
+        "--profile",
+        "ollama",
+        "exec",
+        "-T",
+        "ollama",
+        "ollama",
+        "show",
+        model_name,
+    ]
+    last_error: subprocess.CalledProcessError | None = None
+    for attempt in range(retries):
+        try:
+            subprocess.run(command, cwd=REPO_ROOT, check=True)
+            return
+        except subprocess.CalledProcessError as exc:
+            last_error = exc
+            if attempt + 1 < retries:
+                time.sleep(delay_seconds)
+    if last_error is not None:
+        raise last_error
+
+
 def wait_for_health(timeout_seconds: int) -> None:
     url = "http://localhost:8000/healthz"
     deadline = time.time() + timeout_seconds
@@ -166,7 +241,11 @@ def wait_for_health(timeout_seconds: int) -> None:
         try:
             with urlopen(url, timeout=5) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-                if payload.get("status") == "ok":
+                if (
+                    payload.get("status") == "ok"
+                    and payload.get("collection_available") is True
+                    and payload.get("inference_available") is True
+                ):
                     return
         except (OSError, URLError, ValueError):
             time.sleep(2)
@@ -190,6 +269,8 @@ def main() -> int:
         inference_service = "llama-server" if args.inference == "localgguf" else "ollama"
         run_compose("up", "-d", "chromadb")
         run_compose("--profile", args.inference, "up", "-d", inference_service)
+        if args.inference == "ollama":
+            verify_ollama_model(env_values["OLLAMA_MODEL"])
 
         if not args.skip_ingest:
             ingest_command = [
@@ -214,13 +295,19 @@ def main() -> int:
                 delay_seconds=5,
             )
 
-        # Point the app at the chosen inference backend. The compose default
-        # targets llama-server; override it when running the ollama profile so
-        # the user's deployment/.env LLAMA_API_URL does not have to change.
-        app_env: dict[str, str] = {}
-        if args.inference == "ollama" and "LLAMA_API_URL" not in env_values:
-            app_env["LLAMA_API_URL"] = "http://ollama:11434/v1"
-        run_compose("up", "-d", "app", extra_env=app_env or None)
+        app_env = {
+            "LLAMA_API_URL": (
+                "http://llama-server:8080/v1"
+                if args.inference == "localgguf"
+                else "http://ollama:11434/v1"
+            ),
+            "LLM_MODEL_NAME": (
+                env_values.get("LLM_MODEL_NAME", "qwen3.5-private-analyst")
+                if args.inference == "localgguf"
+                else env_values["OLLAMA_MODEL"]
+            ),
+        }
+        run_compose("up", "-d", "app", extra_env=app_env)
         wait_for_health(args.health_timeout_seconds)
 
         if args.with_proxy:

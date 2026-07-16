@@ -32,7 +32,7 @@
 - Hugging Face upload uses `HF_TOKEN` from the environment; never write it into repo files.
 
 ## Deployment
-- Required before local stack startup: copy `deployment/.env.example` to `deployment/.env`, set a real `CHROMA_AUTH_TOKEN`, provide `ocr_pipeline/chroma_chunks.jsonl`, and place both `Qwen3.5-4B.Q4_K_M.gguf` and matching `Qwen3.5-4B.BF16-mmproj.gguf` in `deployment/models/`.
+- Required before local stack startup: copy `deployment/.env.example` to `deployment/.env`, set a real `CHROMA_AUTH_TOKEN`, provide `ocr_pipeline/chroma_chunks.jsonl`, and place both the `LLM_MODEL` GGUF (default `Qwen3.5-4B.Clean-Recovery.Q4_K_M.gguf`) and matching `Qwen3.5-4B.BF16-mmproj.gguf` in `deployment/models/`.
 - Recommended smoke command from docs: `python deployment/bootstrap_local.py --ingest-limit 1024` (defaults to the `localgguf` llama.cpp backend; pass `--inference ollama` to use the Ollama profile instead).
 - `bootstrap_local.py` starts profile-gated services correctly: `chromadb`, then the chosen inference service (`llama-server` for `localgguf`, `ollama` for `ollama`), then `app`. Local-GGUF validation checks the `LLM_MODEL` file used by `docker-compose.yml` (default `Qwen3.5-4B.Clean-Recovery.Q4_K_M.gguf`).
 - Manual compose flow uses `--env-file deployment/.env`: start Chroma/inference, run the `ingest` profile, then start `app`.

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.metadata
 import importlib.util
 import inspect
 import json
 import logging
 import os
+import random
+import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-name",
-        default="Jackrong/Qwen3.5-4B-Claude-4.6-Opus-Reasoning-Distilled",
+        default="unsloth/Qwen3.5-4B",
         help="Base model to fine-tune.",
     )
     parser.add_argument(
@@ -46,14 +51,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=4,
-        help="Per-device batch size (default: 4).",
+        default=1,
+        help="Per-device batch size (default: 1 for a 16GB GPU).",
     )
     parser.add_argument(
         "--gradient-accumulation",
         type=int,
-        default=2,
-        help="Gradient accumulation steps (default: 2).",
+        default=4,
+        help="Gradient accumulation steps (default: 4).",
     )
     parser.add_argument(
         "--max-memory-ratio",
@@ -76,8 +81,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--eval-split",
         type=float,
-        default=0.05,
-        help="Evaluation split fraction in range [0, 0.5].",
+        default=0.1,
+        help="Evaluation document fraction in range [0, 0.5].",
     )
     parser.add_argument(
         "--max-samples",
@@ -100,8 +105,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lora-alpha",
         type=int,
-        default=32,
-        help="LoRA alpha (default: 32, recommended 2x lora-r for style fine-tuning).",
+        default=16,
+        help="LoRA alpha (default: 16, matching the Qwen3.5 Unsloth recipe).",
     )
     parser.add_argument(
         "--log-steps",
@@ -150,21 +155,6 @@ def parse_args() -> argparse.Namespace:
         help="Also save a merged 16-bit Hugging Face model after training.",
     )
     parser.add_argument(
-        "--push-adapter-repo-id",
-        default=None,
-        help="Optional Hugging Face repo ID for uploading the LoRA adapter.",
-    )
-    parser.add_argument(
-        "--push-merged-repo-id",
-        default=None,
-        help="Optional Hugging Face repo ID for uploading the merged model.",
-    )
-    parser.add_argument(
-        "--hub-private",
-        action="store_true",
-        help="Create pushed Hugging Face repos as private.",
-    )
-    parser.add_argument(
         "--hub-token-env",
         default="HF_TOKEN",
         help="Environment variable name that stores the Hugging Face token.",
@@ -173,11 +163,6 @@ def parse_args() -> argparse.Namespace:
         "--allow-thinking-template",
         action="store_true",
         help="Do not force enable_thinking=False when applying the chat template.",
-    )
-    parser.add_argument(
-        "--disable-response-only-masking",
-        action="store_true",
-        help="Skip Unsloth response-only masking and train on the full formatted sequence.",
     )
     parser.add_argument(
         "--skip-gguf-export",
@@ -239,6 +224,47 @@ def resolve_hub_token(env_name: str) -> str | None:
     return None
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file_handle:
+        for block in iter(lambda: file_handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def set_deterministic_seed(seed: int, torch=None) -> None:
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    if torch is None:
+        return
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def normalize_resume_from_checkpoint(value: str | None) -> str | bool | None:
+    if value is None:
+        return None
+    if value.casefold() == "true":
+        return True
+    return value
+
+
+def _review_status(row: dict[str, Any]) -> str | None:
+    metadata = row.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    status = metadata.get("review_status")
+    return str(status).strip() if status is not None else None
+
+
+def _document_id(row: dict[str, Any]) -> str | None:
+    metadata = row.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    doc_id = metadata.get("doc_id")
+    return str(doc_id).strip() if doc_id is not None else None
+
+
 def _has_nonempty_assistant(messages: Any) -> bool:
     if not isinstance(messages, list):
         return False
@@ -277,6 +303,7 @@ def load_and_validate_dataset(
     max_samples: int | None,
     seed: int,
     allow_empty_assistant: bool,
+    required_review_status: str = "approved",
 ):
     from datasets import load_dataset
 
@@ -289,6 +316,22 @@ def load_and_validate_dataset(
     total_rows = len(dataset)
     if total_rows == 0:
         raise RuntimeError("Dataset is empty.")
+    if required_review_status:
+        invalid_approved_rows = sum(
+            _review_status(row) == required_review_status
+            and not _is_valid_messages_list(row.get("messages"))
+            for row in dataset
+        )
+        empty_approved_rows = sum(
+            _review_status(row) == required_review_status
+            and not _has_nonempty_assistant(row.get("messages"))
+            for row in dataset
+        )
+        if invalid_approved_rows or empty_approved_rows:
+            raise RuntimeError(
+                "Approved rows must all contain valid messages and non-empty assistant targets: "
+                f"invalid_messages={invalid_approved_rows}, empty_assistant={empty_approved_rows}."
+            )
 
     dataset = dataset.filter(lambda row: _is_valid_messages_list(row.get("messages")))
     valid_rows = len(dataset)
@@ -311,13 +354,37 @@ def load_and_validate_dataset(
                 "in finetune_template.jsonl, or run with --allow-empty-assistant."
             )
 
-    if max_samples is not None:
-        max_samples = max(1, max_samples)
-        if len(dataset) > max_samples:
-            dataset = dataset.shuffle(seed=seed).select(range(max_samples))
-            LOGGER.info("Dataset limited to %d rows (--max-samples).", len(dataset))
+    if required_review_status:
+        before = len(dataset)
+        dataset = dataset.filter(
+            lambda row: _review_status(row) == required_review_status
+        )
+        dropped = before - len(dataset)
+        LOGGER.info(
+            "Review gate '%s': kept=%d, dropped=%d",
+            required_review_status,
+            len(dataset),
+            dropped,
+        )
+        if len(dataset) == 0:
+            raise RuntimeError(
+                "No rows passed the review gate. Set metadata.review_status to "
+                f"'{required_review_status}' after human review."
+            )
 
-    return dataset
+    missing_doc_ids = sum(_document_id(row) is None for row in dataset)
+    if missing_doc_ids:
+        raise RuntimeError(
+            f"{missing_doc_ids} rows are missing metadata.doc_id; document-level splitting is required."
+        )
+
+    eligible_rows = len(dataset)
+    sample_limit_applied = max_samples is not None and eligible_rows > max(1, max_samples)
+    if sample_limit_applied:
+        dataset = dataset.shuffle(seed=seed).select(range(max(1, max_samples)))
+        LOGGER.info("Dataset limited to %d rows (--max-samples).", len(dataset))
+
+    return dataset, eligible_rows, sample_limit_applied
 
 
 def load_training_stack() -> dict[str, Any]:
@@ -325,9 +392,9 @@ def load_training_stack() -> dict[str, Any]:
         import torch
         from unsloth import FastLanguageModel
         from transformers import AutoConfig
-        from transformers import DataCollatorForLanguageModeling
         from transformers import Trainer
         from transformers import TrainingArguments
+        from transformers import default_data_collator
     except ImportError as exc:
         raise RuntimeError(
             "Missing training dependencies. Install with: pip install -r finetune/requirements.txt"
@@ -336,7 +403,7 @@ def load_training_stack() -> dict[str, Any]:
     return {
         "torch": torch,
         "AutoConfig": AutoConfig,
-        "DataCollatorForLanguageModeling": DataCollatorForLanguageModeling,
+        "default_data_collator": default_data_collator,
         "Trainer": Trainer,
         "TrainingArguments": TrainingArguments,
         "FastLanguageModel": FastLanguageModel,
@@ -403,7 +470,10 @@ def tokenize_formatted_examples(dataset, tokenizer, max_seq_length: int):
             max_length=max_seq_length,
             padding="max_length",
         )
-        tokens["labels"] = [ids[:] for ids in tokens["input_ids"]]
+        tokens["labels"] = [
+            [token_id if mask else -100 for token_id, mask in zip(ids, masks)]
+            for ids, masks in zip(tokens["input_ids"], tokens["attention_mask"])
+        ]
         return tokens
 
     return dataset.map(
@@ -414,33 +484,68 @@ def tokenize_formatted_examples(dataset, tokenizer, max_seq_length: int):
     )
 
 
+def choose_eval_document_ids(
+    document_ids: list[str], eval_split: float, seed: int
+) -> set[str]:
+    if eval_split <= 0:
+        return set()
+    if eval_split > 0.5:
+        raise ValueError("--eval-split must be <= 0.5")
+
+    unique_ids = sorted(set(document_ids))
+    if len(unique_ids) < 2:
+        raise RuntimeError("Evaluation requires rows from at least two source documents.")
+
+    random.Random(seed).shuffle(unique_ids)
+    eval_count = min(len(unique_ids) - 1, max(1, round(len(unique_ids) * eval_split)))
+    return set(unique_ids[:eval_count])
+
+
+def dataset_document_ids(dataset) -> set[str]:
+    return {
+        doc_id
+        for row in dataset
+        if (doc_id := _document_id(row)) is not None
+    }
+
+
 def split_dataset(dataset, eval_split: float, seed: int):
     if eval_split <= 0:
         return dataset, None
-    if eval_split > 0.5:
-        raise ValueError("--eval-split must be <= 0.5")
-    if len(dataset) < 20:
-        LOGGER.warning("Dataset is very small; disabling eval split.")
-        return dataset, None
 
-    split = dataset.train_test_split(test_size=eval_split, seed=seed)
-    train_set = split["train"]
-    eval_set = split["test"]
-    LOGGER.info("Split dataset -> train=%d, eval=%d", len(train_set), len(eval_set))
+    eval_doc_ids = choose_eval_document_ids(
+        [_document_id(row) for row in dataset if _document_id(row) is not None],
+        eval_split,
+        seed,
+    )
+    train_set = dataset.filter(
+        lambda row: _document_id(row) not in eval_doc_ids,
+        desc="Selecting training documents",
+    )
+    eval_set = dataset.filter(
+        lambda row: _document_id(row) in eval_doc_ids,
+        desc="Selecting evaluation documents",
+    )
+    train_docs = dataset_document_ids(train_set)
+    eval_docs = dataset_document_ids(eval_set)
+    if train_docs & eval_docs:
+        raise RuntimeError("Document-level split leaked source documents across train and eval.")
+    LOGGER.info(
+        "Document split -> train=%d rows/%d docs, eval=%d rows/%d docs",
+        len(train_set),
+        len(train_docs),
+        len(eval_set),
+        len(eval_docs),
+    )
     return train_set, eval_set
 
 
-def maybe_mask_non_assistant_tokens(trainer, tokenizer, disable: bool):
-    if disable:
-        LOGGER.info("Response-only masking DISABLED via flag.")
-        return trainer
-
+def require_response_only_masking(trainer, tokenizer):
     chat_template = getattr(tokenizer, "chat_template", "") or ""
     if "<|im_start|>assistant" not in chat_template:
-        LOGGER.warning(
-            "Chat template does not expose the expected assistant marker; skipping response-only masking."
+        raise RuntimeError(
+            "Assistant-only loss requires a ChatML template with the expected assistant marker."
         )
-        return trainer
 
     try:
         from unsloth.chat_templates import train_on_responses_only
@@ -450,13 +555,11 @@ def maybe_mask_non_assistant_tokens(trainer, tokenizer, disable: bool):
             instruction_part="<|im_start|>user\n",
             response_part="<|im_start|>assistant\n",
         )
-        LOGGER.info("Response-only masking ENABLED.")
-        return trainer
     except Exception as exc:  # noqa: PERF203
-        LOGGER.warning(
-            "Could not enable response-only masking; continuing without it: %s", exc
-        )
-        return trainer
+        raise RuntimeError("Could not enable required assistant-only loss masking.") from exc
+
+    LOGGER.info("Assistant-only loss masking ENABLED.")
+    return trainer
 
 
 def export_gguf(model, tokenizer, output_dir: Path, gguf_name: str) -> None:
@@ -472,15 +575,7 @@ def export_gguf(model, tokenizer, output_dir: Path, gguf_name: str) -> None:
     )
 
 
-def save_merged_model(
-    model,
-    tokenizer,
-    output_dir: Path,
-    *,
-    hub_token: str | None,
-    push_repo_id: str | None,
-    hub_private: bool,
-) -> Path:
+def save_merged_model(model, tokenizer, output_dir: Path) -> Path:
     merged_dir = output_dir / "merged_model"
     merged_dir.mkdir(parents=True, exist_ok=True)
 
@@ -491,49 +586,7 @@ def save_merged_model(
         save_method="merged_16bit",
         maximum_memory_usage=0.6,
     )
-
-    if push_repo_id:
-        if not hub_token:
-            raise RuntimeError(
-                "Cannot push merged model without a Hugging Face token. "
-                "Set the token in the configured hub token environment variable."
-            )
-        LOGGER.info("Uploading merged model to %s", push_repo_id)
-        model.push_to_hub_merged(
-            push_repo_id,
-            tokenizer=tokenizer,
-            save_method="merged_16bit",
-            private=hub_private,
-            token=hub_token,
-        )
-
     return merged_dir
-
-
-def maybe_push_adapter(
-    model,
-    tokenizer,
-    repo_id: str | None,
-    *,
-    hub_private: bool,
-    hub_token: str | None,
-) -> None:
-    if not repo_id:
-        return
-    if not hub_token:
-        raise RuntimeError(
-            "Cannot push adapter without a Hugging Face token. "
-            "Set the token in the configured hub token environment variable."
-        )
-
-    LOGGER.info("Uploading LoRA adapter to %s", repo_id)
-    model.push_to_hub_merged(
-        repo_id,
-        tokenizer=tokenizer,
-        save_method="lora",
-        private=hub_private,
-        token=hub_token,
-    )
 
 
 def log_gpu_state(torch) -> None:
@@ -552,22 +605,18 @@ def log_gpu_state(torch) -> None:
 def verify_model_support(
     model_name: str, hub_token: str | None, auto_config
 ) -> str | None:
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import HfApi
 
     revision = None
     try:
-        revision = snapshot_download(
-            model_name,
-            revision=None,
-            token=hub_token,
-            quiet=True,
-        )
-    except Exception:
-        pass
+        revision = HfApi(token=hub_token).model_info(model_name).sha
+    except Exception as exc:  # noqa: PERF203
+        LOGGER.warning("Could not resolve the base model commit: %s", exc)
 
     try:
         config = auto_config.from_pretrained(
             model_name,
+            revision=revision,
             trust_remote_code=True,
             token=hub_token,
         )
@@ -608,6 +657,8 @@ def build_training_arguments(
         "weight_decay": kwargs["weight_decay"],
         "lr_scheduler_type": "cosine",
         "seed": kwargs["seed"],
+        "data_seed": kwargs["seed"],
+        "full_determinism": True,
         "save_steps": kwargs["save_steps"],
         "save_total_limit": 3,
         "report_to": report_to,
@@ -637,22 +688,100 @@ def build_training_arguments(
     )
 
 
+def current_git_commit() -> str | None:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def current_git_dirty(exclude_path: Path | None = None) -> bool | None:
+    command = ["git", "status", "--porcelain", "--", "."]
+    if exclude_path is not None:
+        try:
+            repo_root = Path(
+                subprocess.run(
+                    ["git", "rev-parse", "--show-toplevel"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+            )
+            relative_path = exclude_path.resolve().relative_to(repo_root.resolve())
+            command.extend(
+                [
+                    f":(exclude){relative_path.as_posix()}",
+                    f":(exclude){relative_path.as_posix()}/**",
+                ]
+            )
+        except (OSError, ValueError, subprocess.CalledProcessError):
+            pass
+    try:
+        return bool(
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def package_versions(names: list[str]) -> dict[str, str | None]:
+    versions: dict[str, str | None] = {}
+    for name in names:
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
+
+
 def write_training_summary(
     output_dir: Path,
     *,
     args: argparse.Namespace,
+    dataset_sha256: str,
     train_rows: int,
     eval_rows: int,
+    train_document_ids: set[str],
+    eval_document_ids: set[str],
     metrics: dict[str, Any],
+    eligible_rows: int,
+    sample_limit_applied: bool,
+    git_commit: str,
+    git_dirty: bool,
     base_model_revision: str | None = None,
 ) -> None:
     payload = {
+        "schema_version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "git_commit": git_commit,
+        "git_dirty": git_dirty,
         "base_model": args.model_name,
         "base_model_revision": base_model_revision,
         "dataset_path": str(args.dataset_path),
+        "dataset_sha256": dataset_sha256,
+        "eligible_rows": eligible_rows,
+        "max_samples": args.max_samples,
+        "sample_limit_applied": sample_limit_applied,
+        "required_review_status": "approved",
         "output_dir": str(output_dir),
+        "seed": args.seed,
+        "split_strategy": "document_id",
         "train_rows": train_rows,
         "eval_rows": eval_rows,
+        "train_document_count": len(train_document_ids),
+        "eval_document_count": len(eval_document_ids),
+        "train_document_ids": sorted(train_document_ids),
+        "eval_document_ids": sorted(eval_document_ids),
         "max_seq_length": args.max_seq_length,
         "batch_size": args.batch_size,
         "gradient_accumulation": args.gradient_accumulation,
@@ -660,37 +789,75 @@ def write_training_summary(
         "num_epochs": args.num_epochs,
         "lora_r": args.lora_r,
         "lora_alpha": args.lora_alpha,
+        "precision": "bfloat16",
+        "assistant_only_loss": True,
         "save_merged_model": args.save_merged_model,
         "skip_gguf_export": args.skip_gguf_export,
+        "resume_from_checkpoint": normalize_resume_from_checkpoint(
+            args.resume_from_checkpoint
+        ),
+        "packages": package_versions(
+            ["torch", "unsloth", "transformers", "datasets", "accelerate", "peft"]
+        ),
         "metrics": metrics,
     }
-    (output_dir / "training_summary.json").write_text(
-        json.dumps(payload, indent=2),
-        encoding="utf-8",
-    )
+    serialized = json.dumps(payload, indent=2, default=str)
+    (output_dir / "run_manifest.json").write_text(serialized, encoding="utf-8")
+    (output_dir / "training_summary.json").write_text(serialized, encoding="utf-8")
 
 
 def run_training(args: argparse.Namespace) -> int:
     check_runtime_environment()
+    set_deterministic_seed(args.seed)
+    if args.allow_empty_assistant and not args.dry_run:
+        raise RuntimeError("--allow-empty-assistant is permitted only with --dry-run.")
+    if not args.dry_run and args.eval_split <= 0:
+        raise RuntimeError("Production training requires --eval-split greater than zero.")
+    if not args.dry_run and not args.skip_gguf_export:
+        raise RuntimeError(
+            "Production training requires --skip-gguf-export; run export_gguf.py from the saved merged model."
+        )
+    training_git_commit = current_git_commit() if not args.dry_run else None
+    training_git_dirty = (
+        current_git_dirty(args.output_dir) if not args.dry_run else None
+    )
+    if not args.dry_run and (
+        not training_git_commit or training_git_dirty is not False
+    ):
+        raise RuntimeError("Production training requires a clean committed worktree.")
+    required_review_status = "" if args.allow_empty_assistant else "approved"
+    dataset_sha256 = sha256_file(args.dataset_path)
 
-    dataset = load_and_validate_dataset(
+    dataset, eligible_rows, sample_limit_applied = load_and_validate_dataset(
         dataset_path=args.dataset_path,
         max_samples=args.max_samples,
         seed=args.seed,
         allow_empty_assistant=args.allow_empty_assistant,
+        required_review_status=required_review_status,
     )
-
+    if sha256_file(args.dataset_path) != dataset_sha256:
+        raise RuntimeError("Dataset changed while loading; refusing to train.")
     LOGGER.info("Validated dataset at %s", args.dataset_path)
     LOGGER.info("Rows ready for training: %d", len(dataset))
+
+    if args.dry_run and args.allow_empty_assistant:
+        train_dataset, eval_dataset = dataset, None
+    else:
+        train_dataset, eval_dataset = split_dataset(dataset, args.eval_split, args.seed)
+    train_document_ids = dataset_document_ids(train_dataset)
+    eval_document_ids = (
+        dataset_document_ids(eval_dataset) if eval_dataset is not None else set()
+    )
 
     if args.dry_run:
         LOGGER.info("Dry run complete. Skipping model initialization and training.")
         return 0
+    assert training_git_commit is not None and training_git_dirty is False
 
     stack = load_training_stack()
     torch = stack["torch"]
     AutoConfig = stack["AutoConfig"]
-    DataCollatorForLanguageModeling = stack["DataCollatorForLanguageModeling"]
+    default_data_collator = stack["default_data_collator"]
     Trainer = stack["Trainer"]
     TrainingArguments = stack["TrainingArguments"]
     FastLanguageModel = stack["FastLanguageModel"]
@@ -698,16 +865,25 @@ def run_training(args: argparse.Namespace) -> int:
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is required for this training script.")
+    if not torch.cuda.is_bf16_supported():
+        raise RuntimeError(
+            "This Qwen3.5 workflow requires a bf16-capable GPU. Do not silently fall back to fp16."
+        )
 
+    set_deterministic_seed(args.seed, torch)
     log_gpu_state(torch)
     base_model_revision = verify_model_support(args.model_name, hub_token, AutoConfig)
+    if not base_model_revision:
+        raise RuntimeError("Could not resolve an immutable base model commit.")
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model_name,
         max_seq_length=args.max_seq_length,
-        dtype=None,
-        load_in_4bit=True,
+        dtype=torch.bfloat16,
+        load_in_4bit=False,
+        load_in_16bit=True,
         token=hub_token,
+        revision=base_model_revision,
     )
     save_tokenizer = tokenizer
 
@@ -748,6 +924,7 @@ def run_training(args: argparse.Namespace) -> int:
         random_state=args.seed,
         use_rslora=False,
         loftq_config=None,
+        max_seq_length=args.max_seq_length,
     )
 
     free_mem, total_mem = torch.cuda.mem_get_info()
@@ -766,18 +943,22 @@ def run_training(args: argparse.Namespace) -> int:
             args.max_memory_ratio * 100,
         )
 
-    dataset = format_chat_examples(
-        dataset,
+    train_dataset = format_chat_examples(
+        train_dataset,
         save_tokenizer,
         allow_thinking_template=args.allow_thinking_template,
     )
-    train_dataset, eval_dataset = split_dataset(dataset, args.eval_split, args.seed)
     train_dataset = tokenize_formatted_examples(
         train_dataset,
         training_tokenizer,
         max_seq_length=args.max_seq_length,
     )
     if eval_dataset is not None:
+        eval_dataset = format_chat_examples(
+            eval_dataset,
+            save_tokenizer,
+            allow_thinking_template=args.allow_thinking_template,
+        )
         eval_dataset = tokenize_formatted_examples(
             eval_dataset,
             training_tokenizer,
@@ -790,8 +971,8 @@ def run_training(args: argparse.Namespace) -> int:
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
     adapter_dir.mkdir(parents=True, exist_ok=True)
 
-    bf16 = bool(torch.cuda.is_bf16_supported())
-    fp16 = not bf16
+    bf16 = True
+    fp16 = False
     optimizer = resolve_optimizer(args.optim)
 
     report_to = [] if args.report_to == "none" else [args.report_to]
@@ -820,10 +1001,7 @@ def run_training(args: argparse.Namespace) -> int:
         "model": model,
         "train_dataset": train_dataset,
         "eval_dataset": eval_dataset,
-        "data_collator": DataCollatorForLanguageModeling(
-            tokenizer=training_tokenizer,
-            mlm=False,
-        ),
+        "data_collator": default_data_collator,
         "args": training_args,
     }
     trainer_signature = inspect.signature(Trainer.__init__)
@@ -833,42 +1011,57 @@ def run_training(args: argparse.Namespace) -> int:
         trainer_kwargs["tokenizer"] = training_tokenizer
 
     trainer = Trainer(**trainer_kwargs)
-    trainer = maybe_mask_non_assistant_tokens(
-        trainer, training_tokenizer, disable=args.disable_response_only_masking
-    )
+    trainer = require_response_only_masking(trainer, training_tokenizer)
+
+    metrics: dict[str, Any] = {}
+    if eval_dataset is not None:
+        baseline_metrics = trainer.evaluate(metric_key_prefix="baseline")
+        metrics.update(baseline_metrics)
+        LOGGER.info("Baseline metrics: %s", baseline_metrics)
 
     LOGGER.info("Starting training...")
-    result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
-    LOGGER.info("Training complete. Metrics: %s", result.metrics)
+    result = trainer.train(
+        resume_from_checkpoint=normalize_resume_from_checkpoint(
+            args.resume_from_checkpoint
+        )
+    )
+    metrics.update(result.metrics)
+    if eval_dataset is not None:
+        final_metrics = trainer.evaluate(metric_key_prefix="final")
+        metrics.update(final_metrics)
+        LOGGER.info("Final evaluation metrics: %s", final_metrics)
+    LOGGER.info("Training complete. Metrics: %s", metrics)
+    if sha256_file(args.dataset_path) != dataset_sha256:
+        raise RuntimeError("Dataset changed during training; refusing to write a run manifest.")
+    if (
+        current_git_commit() != training_git_commit
+        or current_git_dirty(args.output_dir) is not False
+    ):
+        raise RuntimeError("Repository changed during training; refusing to write a run manifest.")
     write_training_summary(
         output_dir,
         args=args,
+        dataset_sha256=dataset_sha256,
         train_rows=len(train_dataset),
         eval_rows=len(eval_dataset) if eval_dataset is not None else 0,
-        metrics=result.metrics,
+        train_document_ids=train_document_ids,
+        eval_document_ids=eval_document_ids,
+        metrics=metrics,
+        eligible_rows=eligible_rows,
+        sample_limit_applied=sample_limit_applied,
+        git_commit=training_git_commit,
+        git_dirty=training_git_dirty,
         base_model_revision=base_model_revision,
     )
 
     LOGGER.info("Saving LoRA adapter to %s", adapter_dir)
+    for peft_config in getattr(model, "peft_config", {}).values():
+        peft_config.base_model_name_or_path = args.model_name
+        peft_config.revision = base_model_revision
     model.save_pretrained(str(adapter_dir))
     save_tokenizer.save_pretrained(str(adapter_dir))
-    maybe_push_adapter(
-        model,
-        save_tokenizer,
-        args.push_adapter_repo_id,
-        hub_private=args.hub_private,
-        hub_token=hub_token,
-    )
-
-    if args.save_merged_model or args.push_merged_repo_id:
-        save_merged_model(
-            model,
-            save_tokenizer,
-            output_dir,
-            hub_token=hub_token,
-            push_repo_id=args.push_merged_repo_id,
-            hub_private=args.hub_private,
-        )
+    if args.save_merged_model:
+        save_merged_model(model, save_tokenizer, output_dir)
 
     if not args.skip_gguf_export:
         export_gguf(model, save_tokenizer, output_dir, args.gguf_name)

@@ -1,7 +1,7 @@
 services:
   # ── Ollama inference server ────────────────────────────────────────────────
-  # Model is pulled from your public HF repo on first run.
-  # Cached in ollama_data volume — subsequent starts skip re-download.
+  # Model must already exist in the persistent ollama_data volume.
+  # Bootstrap verifies the exact local OLLAMA_MODEL name before starting the app.
   #
   # For local GGUF deployment (e.g. trained recovery model), use the
   # llama-server service below instead of this one.
@@ -11,11 +11,8 @@ services:
     environment:
       - OLLAMA_HOST=0.0.0.0
       - OLLAMA_MODELS=/root/.ollama/models
-      # Model loaded at startup; accessible at http://ollama:11434/v1
-      - OLLAMA_MODEL=${OLLAMA_MODEL:-hf.co/Mikkkkoooo/qwen35-4b-private-analyst-full-corpus}
     volumes:
       - ollama_data:/root/.ollama
-    # ollama serve stays in foreground, model auto-loaded via OLLAMA_MODEL
     command: serve
     deploy:
       resources:
@@ -30,17 +27,27 @@ services:
 
   # ── llama.cpp server for local GGUF ───────────────────────────────────────
   # Use this instead of ollama when deploying a local GGUF file.
-  # Set LLM_MODEL_PATH env var to the model file name in /models
+  # Set LLM_MODEL to the model file name in /models
   llama-server:
     image: ghcr.io/ggerganov/llama.cpp:server
     container_name: llama_server
-    environment:
-      - HOST=0.0.0.0
-      - PORT=8080
-      - MODEL=/models/${LLM_MODEL:-Qwen3.5-4B.Clean-Recovery.Q4_K_M.gguf}
-      - N_ctx=8192
-      - N_gpu_layers=32
-      - THREADS=4
+    command:
+      - --model
+      - /models/${LLM_MODEL:-Qwen3.5-4B.Clean-Recovery.Q4_K_M.gguf}
+      - --mmproj
+      - /models/${LLAMA_MMPROJ_FILENAME:-Qwen3.5-4B.BF16-mmproj.gguf}
+      - --alias
+      - ${LLM_MODEL_NAME:-qwen3.5-private-analyst}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --ctx-size
+      - "8192"
+      - --n-gpu-layers
+      - "32"
+      - --threads
+      - "4"
     volumes:
       - ./models:/models:ro
     ports:
@@ -100,6 +107,8 @@ services:
       - LLM_MODEL_NAME=${LLM_MODEL_NAME:-qwen3.5-private-analyst}
       - RETRIEVAL_TOP_K=${RETRIEVAL_TOP_K:-4}
       - MAX_CONTEXT_CHARS=${MAX_CONTEXT_CHARS:-12000}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.1}
+      - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-900}
       - LLM_TIMEOUT_SECONDS=${LLM_TIMEOUT_SECONDS:-120}
     volumes:
       - ../ocr_pipeline:/data/ocr_pipeline:ro

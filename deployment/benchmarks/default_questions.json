@@ -2,16 +2,36 @@
   {
     "id": "acb_margin_risks",
     "question": "What are the key margin risks for ACB?",
-    "expected_keywords": ["margin", "CIR", "credit", "risk"]
+    "expected_mode": "model",
+    "expected_keywords": ["margin", "CIR", "credit", "risk"],
+    "minimum_keyword_hits": 2
   },
   {
     "id": "acb_asset_quality",
     "question": "How does the corpus describe ACB asset quality?",
-    "expected_keywords": ["asset", "quality", "NPL", "loan"]
+    "expected_mode": "model",
+    "expected_keywords": ["asset", "quality", "NPL", "loan"],
+    "minimum_keyword_hits": 2
   },
   {
     "id": "acb_target_price",
     "question": "What target price or recommendation changes are mentioned for ACB?",
-    "expected_keywords": ["target", "price", "recommendation", "upgrade"]
+    "expected_mode": "model",
+    "expected_keywords": ["target", "price", "recommendation", "upgrade"],
+    "minimum_keyword_hits": 2
+  },
+  {
+    "id": "bank_funding_comparison",
+    "question": "Compare the funding-cost trends of Sacombank and BIDV using the indexed reports.",
+    "expected_mode": "model",
+    "expected_keywords": ["funding", "cost", "Sacombank", "BIDV"],
+    "minimum_keyword_hits": 2
+  },
+  {
+    "id": "unsupported_antarctica",
+    "question": "What capital adequacy rules apply to commercial banks headquartered in Antarctica?",
+    "expected_mode": "refusal",
+    "expected_keywords": [],
+    "minimum_keyword_hits": 0
   }
 ]

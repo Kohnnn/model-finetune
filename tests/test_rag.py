@@ -4,10 +4,17 @@ from prompts import build_query_messages
 from rag import (
     RetrievedChunk,
     answer_is_grounded,
+    answer_is_refusal,
     build_context_block,
     build_fallback_answer,
     build_source_records,
+    model_is_available,
 )
+
+
+def test_inference_health_requires_configured_model() -> None:
+    assert model_is_available({"other-model"}, "private-model") is False
+    assert model_is_available({"private-model:latest"}, "private-model") is True
 
 
 def test_build_context_block_respects_limit() -> None:
@@ -59,10 +66,16 @@ def test_build_query_messages_enforces_grounding() -> None:
     assert "[S1]" in messages[1]["content"]
 
 
-def test_answer_is_grounded_requires_citations() -> None:
-    assert answer_is_grounded("Margins improved [S1].") is True
-    assert answer_is_grounded("Margins improved without citation.") is False
-    assert answer_is_grounded("import torch\nfrom x import y [S1]") is False
+def test_answer_is_grounded_requires_valid_citations() -> None:
+    assert answer_is_grounded("Margins improved [S1].", source_count=1) is True
+    assert answer_is_grounded("Margins improved [S2].", source_count=1) is False
+    assert answer_is_grounded("Margins improved without citation.", source_count=1) is False
+    assert answer_is_grounded("import torch\nfrom x import y [S1]", source_count=1) is False
+
+
+def test_answer_is_refusal_detects_insufficient_evidence() -> None:
+    assert answer_is_refusal("There is insufficient evidence in the context.") is True
+    assert answer_is_refusal("Margins improved [S1].") is False
 
 
 def test_build_fallback_answer_uses_evidence_excerpts() -> None:

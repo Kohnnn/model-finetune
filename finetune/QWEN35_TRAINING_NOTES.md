@@ -1,5 +1,7 @@
 # Qwen 3.5 Fine-Tuning Notes
 
+> Historical evidence: this run used draft data and full-sequence loss. Do not reuse its training command. Follow [`../docs/fine-tuning-visual-journal.md`](../docs/fine-tuning-visual-journal.md) for the release path.
+
 This document records the troubleshooting and final execution path used to fine-tune `unsloth/Qwen3.5-4B` on the local RTX 4060 Ti 16GB machine and publish the final merged model to a private Hugging Face repo.
 
 ## Goal

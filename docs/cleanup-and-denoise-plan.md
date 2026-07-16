@@ -133,6 +133,12 @@ as a collapsible text fallback.
 > Note: the `xai/grok-2-image-1212` and `cx/gpt-5.3-image` models returned provider auth /
 > account errors at generation time; `cx/gpt-5.4-image` worked.
 
+The beginner fine-tuning journal adds 12 lifecycle diagrams under
+`docs/assets/fine-tuning-journal/`. They were generated through 9Router with
+`cx/gpt-5.5-image`, using the two architecture PNGs above as direct base64 style
+references. Provider output was normalized to 1792x1024 PNG. No corpus content or
+credentials were included in image prompts.
+
 ## Next steps (brainstorm)
 
 Roughly in priority order:

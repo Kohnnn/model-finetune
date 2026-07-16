@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from finetune.train import apply_chat_template, resolve_hub_token
+from finetune.train import (
+    apply_chat_template,
+    choose_eval_document_ids,
+    normalize_resume_from_checkpoint,
+    resolve_hub_token,
+)
 
 
 class _DummyTokenizer:
@@ -31,3 +36,21 @@ def test_resolve_hub_token_reads_env(monkeypatch) -> None:
     monkeypatch.setenv("HF_TOKEN_TEST", "secret-value")
 
     assert resolve_hub_token("HF_TOKEN_TEST") == "secret-value"
+
+
+def test_document_split_is_deterministic_and_disjoint() -> None:
+    document_ids = ["doc-c", "doc-a", "doc-b", "doc-a"]
+
+    first = choose_eval_document_ids(document_ids, eval_split=0.34, seed=3407)
+    second = choose_eval_document_ids(document_ids, eval_split=0.34, seed=3407)
+
+    assert first == second
+    assert first
+    assert first < set(document_ids)
+
+
+def test_resume_true_is_normalized_for_transformers() -> None:
+    assert normalize_resume_from_checkpoint("True") is True
+    assert normalize_resume_from_checkpoint("true") is True
+    assert normalize_resume_from_checkpoint("checkpoint-20") == "checkpoint-20"
+    assert normalize_resume_from_checkpoint(None) is None
