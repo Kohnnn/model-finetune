@@ -20,6 +20,7 @@ raw_dataset/
 ocr_pipeline/chroma_chunks.jsonl
 ocr_pipeline/finetune_template.jsonl
 ocr_pipeline/parse_failures.log
+ocr_pipeline/parse_manifest.jsonl
 ocr_pipeline/markdown_reports/
 ocr_pipeline/markdown_reports_samples/
 finetune/outputs/
@@ -35,9 +36,9 @@ deployment/chroma_data/*
 !deployment/chroma_data/.gitkeep
 deployment/model_cache/*
 !deployment/model_cache/.gitkeep
-deployment/benchmarks/*.md
-deployment/benchmarks/*.json
+deployment/benchmarks/**
 !deployment/benchmarks/default_questions.json
+!deployment/benchmarks/claim_ledger_template.json
 
 # Misc
 trace_dill.txt

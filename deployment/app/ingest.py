@@ -3,13 +3,21 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
 import chromadb
 
 from embeddings import get_embedding_model
-from settings import get_settings
+from settings import (
+    acquire_ingestion_lock,
+    get_settings,
+    hash_collection_snapshot,
+    release_ingestion_lock,
+    snapshot_input,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -70,6 +78,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=64,
         help="Number of chunks to embed and upsert per batch.",
+    )
+    parser.add_argument(
+        "--lock-path",
+        type=Path,
+        default=Path(
+            os.getenv(
+                "INGESTION_LOCK_PATH",
+                "/run/private-analyst-locks/ingest.lock",
+            )
+        ),
+        help="Shared lock file used to serialize ingestion and fail serving closed.",
     )
     parser.add_argument(
         "--limit",
@@ -137,7 +156,9 @@ def iter_rows(input_path: Path):
 
 
 def flush_batch(
-    collection, embedding_model, batch: list[tuple[str, str, dict]]
+    collection,
+    embedding_model,
+    batch: list[tuple[str, str, dict]],
 ) -> None:
     if not batch:
         return
@@ -155,41 +176,78 @@ def flush_batch(
     )
 
 
-def run_ingestion(args: argparse.Namespace) -> int:
-    if not args.input_path.exists():
-        raise FileNotFoundError(f"Input JSONL not found: {args.input_path}")
-
+def _run_ingestion_snapshot(
+    args: argparse.Namespace,
+    input_path: Path,
+    corpus_sha256: str,
+) -> int:
+    available_rows = sum(1 for _ in iter_rows(input_path))
+    expected_rows = available_rows if args.limit is None else min(args.limit, available_rows)
     chroma_client = create_chroma_client(args.chroma_api_url, args.chroma_auth_token)
-    collection = chroma_client.get_or_create_collection(
-        name=args.collection_name,
-        metadata={"embedding_model": args.embedding_model},
+    collection = chroma_client.get_or_create_collection(name=args.collection_name)
+    index_generation = uuid.uuid4().hex
+    collection.modify(
+        metadata={
+            "embedding_model": args.embedding_model,
+            "corpus_sha256": corpus_sha256,
+            "index_rows": expected_rows,
+            "index_state": "ingesting",
+            "index_generation": index_generation,
+        }
     )
     embedding_model = get_embedding_model(args.embedding_model)
-
     batch: list[tuple[str, str, dict]] = []
+    desired_ids: set[str] = set()
     total_rows = 0
 
-    for chunk_id, text, metadata in iter_rows(args.input_path):
+    for chunk_id, text, metadata in iter_rows(input_path):
         batch.append((chunk_id, text, metadata))
+        desired_ids.add(chunk_id)
         total_rows += 1
-
         if args.limit is not None and total_rows >= args.limit:
             break
-
         if len(batch) >= args.batch_size:
             flush_batch(collection, embedding_model, batch)
             LOGGER.info("Upserted %d rows", total_rows)
             batch.clear()
 
-    if batch:
-        flush_batch(collection, embedding_model, batch)
-
+    flush_batch(collection, embedding_model, batch)
+    existing_ids = set(collection.get(include=[])["ids"])
+    stale_ids = sorted(existing_ids - desired_ids)
+    for start in range(0, len(stale_ids), args.batch_size):
+        collection.delete(ids=stale_ids[start : start + args.batch_size])
+    if collection.count() != expected_rows:
+        raise RuntimeError("Chroma index inventory does not match the input snapshot.")
+    metadata = {
+        "embedding_model": args.embedding_model,
+        "corpus_sha256": corpus_sha256,
+        "index_rows": expected_rows,
+        "index_state": "complete" if args.limit is None else "pilot",
+        "index_generation": index_generation,
+    }
+    if args.limit is None:
+        metadata["index_sha256"] = hash_collection_snapshot(collection)
+    collection.modify(metadata=metadata)
     LOGGER.info(
         "Ingestion complete. Collection=%s | rows_upserted=%d",
         args.collection_name,
         total_rows,
     )
     return 0
+
+
+def run_ingestion(args: argparse.Namespace) -> int:
+    if not args.input_path.exists():
+        raise FileNotFoundError(f"Input JSONL not found: {args.input_path}")
+    lock_token = acquire_ingestion_lock(args.lock_path)
+    snapshot_path: Path | None = None
+    try:
+        snapshot_path, corpus_sha256 = snapshot_input(args.input_path)
+        return _run_ingestion_snapshot(args, snapshot_path, corpus_sha256)
+    finally:
+        if snapshot_path is not None:
+            snapshot_path.unlink(missing_ok=True)
+        release_ingestion_lock(args.lock_path, lock_token)
 
 
 def main() -> int:

@@ -78,7 +78,7 @@ The parser reads PDF, DOCX, and PPTX files, removes known boilerplate, chunks us
   --extensions .pdf .docx .pptx
 ```
 
-Each row carries `metadata.doc_id`. That stable document identifier is later used to prevent evaluation leakage.
+Each retained document carries content and file hashes, a stable `doc_id`, and a `document_family_id`. Exact normalized-content duplicates are removed; strict SimHash grouping keeps likely revisions in one split family. `parse_manifest.jsonl` records parsed, skipped, and failed files without changing the private output contract. Review `parse_failures.log` and extraction warnings, especially image-only PDF pages, before dataset preparation.
 
 ## 4. Understand one JSONL example
 
@@ -93,8 +93,16 @@ Each row carries `metadata.doc_id`. That stable document identifier is later use
   ],
   "metadata": {
     "doc_id": "stable_source_document_id",
-    "chunk_index": 3,
-    "review_status": "approved"
+    "document_family_id": "stable_revision_family_id",
+    "source_file_sha256": "64_hex_characters",
+    "context_sha256": "64_hex_characters",
+    "source_spans": [{"start_page": 3, "end_page": 3}],
+    "task_type": "risk_analysis",
+    "language": "en",
+    "review_status": "approved",
+    "reviewed_by": "reviewer_id",
+    "reviewed_at": "2026-07-16T10:00:00+00:00",
+    "approval_checklist_version": "v1"
   }
 }
 ```
@@ -117,17 +125,28 @@ The seed generator extracts candidate analytical text. It deliberately marks eve
 
 For every row selected for training:
 
-1. open the source context and assistant completion;
-2. correct unsupported claims, copied boilerplate, broken numbers, and poor prose;
-3. reject weak or ambiguous examples;
-4. set `metadata.review_status` to `approved` only after inspection;
-5. save approved rows to a separate private JSONL file.
+1. open the source context, recorded source span, and assistant completion;
+2. replace heuristic draft prose with an original reviewed target;
+3. verify every claim and number against the source; list deliberately verified external numbers in `verified_external_numbers`;
+4. correct copied boilerplate, broken numbers, unsupported claims, and poor prose;
+5. reject weak, ambiguous, or extraction-damaged examples;
+6. complete `reviewed_by`, timezone-aware `reviewed_at`, and `approval_checklist_version`;
+7. set `metadata.review_status` to `approved` only after inspection;
+8. save approved rows to a separate private JSONL file.
 
 ![Draft, review, and approval gate](assets/fine-tuning-journal/05_draft_review_approval_gate.png)
 
-The training script drops everything except `approved`. It also blocks rows without `metadata.doc_id`.
+Audit the private approved file before loading a model:
 
-Validate without loading a model:
+```powershell
+.venv\Scripts\python.exe finetune/audit_dataset.py `
+  --dataset-path finetune/outputs/datasets/qwen35_approved_sft.jsonl `
+  --report-path finetune/outputs/datasets/qwen35_approved_sft.audit.json
+```
+
+Require zero errors. The audit checks message order, review fields, hashes, spans, source-supported numbers, duplicate rows, conflicting targets, shared shingles, and assistant-to-context copy ratio without printing row content. `train.py` reruns this audit and accepts only approved rows.
+
+Validate formatting and splitting without loading a model:
 
 ```powershell
 .venv\Scripts\python.exe finetune/train.py `
@@ -141,15 +160,15 @@ For parser-only validation of the empty template, use the explicit non-training 
 .venv\Scripts\python.exe finetune/train.py --dry-run --allow-empty-assistant --max-samples 10
 ```
 
-## 6. Split by source document, not row
+## 6. Split by document family, not row
 
-Overlapping chunks from one report are similar. A row-level split can put one chunk in training and its neighbor in evaluation, making the score look better than reality.
+Overlapping chunks, exact copies, and minor report revisions are similar. A row-level or document-only split can put one revision in training and another in evaluation, making the score look better than reality.
 
-The pipeline chooses evaluation **document IDs** deterministically, then puts all chunks from each chosen report into evaluation.
+The pipeline chooses evaluation **document family IDs** deterministically, then puts every document and chunk from each chosen family into evaluation. `--max-samples` also selects complete families where possible.
 
 ![Document-level train and evaluation split](assets/fine-tuning-journal/06_document_level_split.png)
 
-The run manifest records both document lists. The release gate fails if they overlap.
+The run manifest records document and family lists with `split_strategy=document_family_id`. The release gate fails if either document IDs or family IDs overlap.
 
 ## 7. Chat templates and assistant-only loss
 
@@ -241,6 +260,39 @@ After serving the candidate:
 
 A grounded model answer must use `answer_mode=model`, cite only labels actually returned in `sources`, and meet keyword coverage. Evidence fallback is safe but fails model-quality and refusal questions. The unsupported Antarctica question must return `answer_mode=insufficient_evidence`.
 
+The five cases are a fixed release smoke, not a statistically useful quality benchmark. Build a private 100–150-case claim-ledger pack from document families excluded from training. Start from `deployment/benchmarks/claim_ledger_template.json`; every case records expected claims, numbers, supporting `doc_id` values, prohibited terms, language, task type, criticality, and frozen evidence. Use JSON numbers for locale-neutral values and exact strings such as `"1,5%"` or `"1.500"` when locale-specific display matters. Keep the completed pack local and gitignored.
+
+Use the checksum-verified `localgguf` backend and pin `LLAMA_CPP_IMAGE` as `repository@sha256:<64 hex>`. Bootstrap launches only Compose values validated from `deployment/.env`, and the running app independently verifies mounted GGUF/mmproj bytes against `SHA256SUMS`. Ingestion uses an immutable source snapshot and a shared exclusive lock; serving fails closed while that lock exists. Set distinct random values of at least 32 characters for `EVALUATION_API_TOKEN` and `EVALUATION_ATTESTATION_KEY` in `deployment/.env`. Export only `EVALUATION_API_TOKEN` while running the evaluator. Export only `EVALUATION_ATTESTATION_KEY` while running release validation. Empty values disable `/retrieve` and `/generate-with-evidence`; Compose exposes both the app and raw llama-server only on `127.0.0.1`, and nginx blocks evaluation routes and credentials. After human review freezes the pack, run `deployment/evaluate_claim_ledger.py --pack deployment/benchmarks/private_claim_ledger_v1.json --print-pack-sha256` and independently record the result as `EXPECTED_CLAIM_LEDGER_PACK_SHA256`. After approving the baseline, independently record its `evaluation_target_sha256` as `EXPECTED_BASELINE_EVALUATION_TARGET_SHA256`.
+
+Serve the base model and run all three lanes:
+
+```powershell
+.venv\Scripts\python.exe deployment/evaluate_claim_ledger.py `
+  --pack deployment/benchmarks/private_claim_ledger_v1.json `
+  --lane all `
+  --json-output deployment/benchmarks/claim_ledger_baseline.json `
+  --markdown-output deployment/benchmarks/claim_ledger_baseline.md
+```
+
+Replace the model bundle, recreate the app container, then serve the trained candidate against the same Chroma collection and unchanged pack:
+
+```powershell
+.venv\Scripts\python.exe deployment/evaluate_claim_ledger.py `
+  --pack deployment/benchmarks/private_claim_ledger_v1.json `
+  --lane all `
+  --baseline-json deployment/benchmarks/claim_ledger_baseline.json `
+  --json-output deployment/benchmarks/claim_ledger_candidate.json `
+  --markdown-output deployment/benchmarks/claim_ledger_candidate.md
+```
+
+The lanes isolate failure causes:
+
+- `frozen`: generation against identical supplied evidence through `/generate-with-evidence`;
+- `retrieval`: recall@k only through `/retrieve`;
+- `live`: end-to-end RAG through `/query`.
+
+The evaluator requires matching pack hashes, question identities, top-k, case/lane inventories, and shared corpus/index/app/runtime/generation-config/collection/embedding identities for paired comparison. The app signs endpoint, request identity, retrieval settings, evidence identity, answer, mode, cited document IDs, end-to-end server latency, and an evaluation target derived from actual mounted GGUF/mmproj/corpus bytes, actual Chroma vectors/content plus ingestion generation, running app code, the digest-pinned llama.cpp runtime/configuration, and generation settings. Local reports retain these attestations and scoring inputs but omit source excerpts and paths. Release validation takes the reviewed pack plus baseline and candidate reports, verifies every HMAC attestation and independent pin, requires the candidate model/mmproj hashes to match the export manifest, recomputes every result, aggregate, and paired comparison, and hashes all three inputs. It exits nonzero below claim, numeric, citation, retrieval, refusal, or latency thresholds, and on any critical regression. Citation support means the answer cited a source whose `doc_id` is listed for the claim; human review is still required for semantic entailment.
+
 ![Baseline, candidate, and release gates](assets/fine-tuning-journal/10_baseline_candidate_release_gates.png)
 
 ## 12. Export GGUF and hash every artifact
@@ -266,26 +318,34 @@ Copy the two GGUF files and checksum file to `deployment/models/`. Bootstrap rec
 Run the gate after candidate evaluation and GGUF export:
 
 ```powershell
+$env:EVALUATION_ATTESTATION_KEY = "<independently managed attestation key>"
+$env:EXPECTED_CLAIM_LEDGER_PACK_SHA256 = "<reviewed canonical pack SHA-256>"
+$env:EXPECTED_BASELINE_EVALUATION_TARGET_SHA256 = "<approved baseline evaluation_target_sha256>"
 .venv\Scripts\python.exe finetune/validate_release.py `
   --run-dir finetune/outputs/qwen35_4b_approved_v1 `
-  --benchmark-json deployment/benchmarks/candidate.json
+  --benchmark-json deployment/benchmarks/candidate.json `
+  --claim-ledger-pack deployment/benchmarks/private_claim_ledger_v1.json `
+  --claim-ledger-baseline-json deployment/benchmarks/claim_ledger_baseline.json `
+  --claim-ledger-json deployment/benchmarks/claim_ledger_candidate.json
 ```
 
 The command requires:
 
-- every eligible approved row, with no sample truncation;
-- disjoint train and evaluation documents;
+- every eligible approved row and a zero-error dataset audit, with no sample truncation;
+- disjoint train and evaluation documents and document families;
 - assistant-only loss and bf16 LoRA;
 - an immutable base model revision loaded by commit;
 - committed training code with a clean worktree;
 - train loss below `1.2`;
 - final evaluation loss below baseline evaluation loss;
-- at least four of five benchmark cases passing;
-- a safe unsupported-question fallback;
+- at least four of five fixed smoke cases passing with a safe unsupported-question fallback;
+- at least 100 claim-ledger cases, including model, refusal, retrieval, and numeric coverage, scored in frozen, retrieval, and live lanes;
+- claim, numeric, citation precision/completeness, and retrieval recall@k each at least `0.75`;
+- perfect refusal correctness, zero false refusals, p95 latency at most 180 seconds, matching baseline identity/inventory, and no critical regression;
 - merged model, model GGUF, and mmproj files;
 - SHA-256 verification.
 
-On success it writes `release_manifest.json`, `SHA256SUMS`, a model card, a metadata-only dataset card, `run_summary.json`, and `benchmark_summary.json`. Raw benchmark answers and the local manifest's paths and document IDs remain local.
+On success it writes `release_manifest.json`, `SHA256SUMS`, a model card, a metadata-only dataset card, `run_summary.json`, `benchmark_summary.json`, and `claim_ledger_summary.json`. Raw benchmark answers, questions, per-case IDs, private evidence, paths, and document IDs remain local.
 
 ## 14. Publish privately and verify the Hub
 
@@ -339,11 +399,15 @@ A failed release is useful evidence:
 - **approved_data_only:** finish human review;
 - **full_approved_dataset:** remove a truncating `--max-samples` cap;
 - **committed_training_code:** commit the intended code, then train from a clean worktree;
+- **approved_dataset_audit:** repair review, provenance, hash, span, duplicate, or numeric-support errors;
+- **document_family_split:** repair missing or reused `document_family_id` metadata;
 - **document_split:** repair missing or reused `doc_id` metadata;
 - **assistant_only_loss:** fix the model chat template or Unsloth version;
 - **eval_improvement:** revise data or hyperparameters; do not release;
-- **benchmark:** inspect per-question modes, citations, and expected concepts;
+- **benchmark:** inspect fixed-smoke modes, citations, and expected concepts;
 - **fallback_safety:** restore the refusal path before any deployment;
+- **claim_ledger_quality:** inspect claim, number, citation, retrieval, refusal, lane inventory, and latency metrics;
+- **claim_ledger_comparison:** use the identical pack and result inventory, then fix critical regressions;
 - **gguf_bundle:** export or copy the matching mmproj;
 - **checksum mismatch:** recopy artifacts; never update a hash to hide unexplained drift.
 
@@ -355,12 +419,13 @@ Open [`notebooks/private_analyst_fine_tuning_tutorial.ipynb`](../notebooks/priva
 
 - [ ] I can explain why RAG owns facts and fine-tuning owns behavior.
 - [ ] Every training row is human-reviewed and marked `approved`.
-- [ ] Every row has `metadata.doc_id`.
-- [ ] Train and evaluation documents are disjoint.
+- [ ] Every row has source hashes/spans, `metadata.doc_id`, and `metadata.document_family_id`.
+- [ ] `audit_dataset.py` reports zero errors.
+- [ ] Train and evaluation documents and families are disjoint.
 - [ ] The run used bf16 LoRA and assistant-only loss.
 - [ ] `run_manifest.json` names an immutable base revision and dataset hash.
-- [ ] Candidate evaluation did not regress from baseline.
-- [ ] At least four of five benchmark cases pass and refusal is safe.
+- [ ] The 100–150-case frozen, retrieval, and live comparison meets thresholds with no critical regression.
+- [ ] At least four of five fixed smoke cases pass and refusal is safe.
 - [ ] GGUF and mmproj hashes verify.
 - [ ] `validate_release.py` passes.
 - [ ] Hugging Face model and metadata-only dataset repositories are private.

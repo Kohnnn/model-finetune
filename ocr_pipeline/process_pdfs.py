@@ -7,9 +7,10 @@ import logging
 import random
 import re
 import sys
+import traceback
 from pathlib import Path
 from time import perf_counter
-from typing import Iterable
+from typing import Any, Iterable
 
 LOGGER = logging.getLogger(__name__)
 
@@ -183,11 +184,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--trim-tail-pages",
         type=int,
-        default=3,
+        default=0,
         help=(
             "Drop this many trailing pages/slides/sections as likely disclaimers "
-            "when possible (default: 3)."
+            "when possible (default: 0)."
         ),
+    )
+    parser.add_argument(
+        "--keep-duplicates",
+        action="store_true",
+        help="Keep documents with identical normalized analytical content.",
+    )
+    parser.add_argument(
+        "--near-duplicate-distance",
+        type=int,
+        default=3,
+        help="Maximum 64-bit SimHash distance for grouping revisions into one document family.",
+    )
+    parser.add_argument(
+        "--allow-pilot-overwrite",
+        action="store_true",
+        help="Allow --limit to overwrite the default ocr_pipeline outputs.",
     )
     parser.add_argument(
         "--log-level",
@@ -357,16 +374,106 @@ def build_doc_id(relative_source: str) -> str:
     return f"{doc_id}_{digest}"
 
 
-def build_document_metadata(file_path: Path, input_dir: Path, text: str) -> dict:
+def sha256_file(file_path: Path) -> str:
+    digest = hashlib.sha256()
+    with file_path.open("rb") as source_file:
+        for block in iter(lambda: source_file.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def content_sha256(text: str) -> str:
+    return hashlib.sha256(normalize_for_matching(text).encode("utf-8")).hexdigest()
+
+
+def content_simhash(text: str) -> int:
+    tokens = re.findall(r"\w+", normalize_for_matching(text))
+    if not tokens:
+        return 0
+    shingles = [" ".join(tokens[index : index + 5]) for index in range(max(1, len(tokens) - 4))]
+    weights = [0] * 64
+    for shingle in shingles:
+        value = int.from_bytes(hashlib.blake2b(shingle.encode("utf-8"), digest_size=8).digest(), "big")
+        for bit in range(64):
+            weights[bit] += 1 if value & (1 << bit) else -1
+    result = 0
+    for bit, weight in enumerate(weights):
+        if weight >= 0:
+            result |= 1 << bit
+    return result
+
+
+def simhash_distance(first: int, second: int) -> int:
+    return (first ^ second).bit_count()
+
+
+def find_family_root(parents: dict[str, str], family_id: str) -> str:
+    root = family_id
+    while parents[root] != root:
+        root = parents[root]
+    while parents[family_id] != family_id:
+        parent = parents[family_id]
+        parents[family_id] = root
+        family_id = parent
+    return root
+
+
+def add_near_duplicate_family(
+    simhash: int,
+    family_id: str,
+    families: list[tuple[int, str]],
+    parents: dict[str, str],
+    maximum_distance: int,
+) -> bool:
+    parents.setdefault(family_id, family_id)
+    matches = {
+        candidate_family
+        for candidate_simhash, candidate_family in families
+        if simhash_distance(simhash, candidate_simhash) <= maximum_distance
+    }
+    for candidate_family in matches:
+        first = find_family_root(parents, family_id)
+        second = find_family_root(parents, candidate_family)
+        if first != second:
+            canonical, merged = sorted((first, second))
+            parents[merged] = canonical
+    families.append((simhash, family_id))
+    return bool(matches)
+
+
+def canonicalize_document_families(
+    rows: list[dict[str, Any]],
+    parents: dict[str, str],
+) -> None:
+    for row in rows:
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else row
+        family_id = metadata.get("document_family_id")
+        if isinstance(family_id, str) and family_id in parents:
+            metadata["document_family_id"] = find_family_root(parents, family_id)
+
+
+def build_document_metadata(
+    file_path: Path,
+    input_dir: Path,
+    text: str,
+    extraction_method: str = "primary",
+    extraction_warnings: list[str] | None = None,
+) -> dict[str, Any]:
     relative_source = str(file_path.relative_to(input_dir))
+    normalized_sha256 = content_sha256(text)
     return {
-        "source": str(file_path),
         "relative_source": relative_source,
         "doc_id": build_doc_id(relative_source),
         "title": infer_document_title(file_path),
         "year": infer_document_year(relative_source),
         "language": infer_document_language(relative_source, text),
         "file_extension": file_path.suffix.lower(),
+        "source_file_sha256": sha256_file(file_path),
+        "content_sha256": normalized_sha256,
+        "document_family_id": f"family_{normalized_sha256}",
+        "extraction_method": extraction_method,
+        "parser_schema_version": "2",
+        "extraction_warnings": json.dumps(extraction_warnings or [], ensure_ascii=False),
     }
 
 
@@ -393,12 +500,45 @@ def extract_docx_pages(file_path: Path) -> list[str]:
             "Missing dependency 'python-docx'. Install with: pip install python-docx"
         ) from exc
 
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
     doc = docx.Document(file_path)
-    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-    grouped_pages: list[str] = []
-    for i in range(0, len(paragraphs), 30):
-        grouped_pages.append("\n".join(paragraphs[i : i + 30]))
-    return grouped_pages
+    blocks: list[str] = []
+    for child in doc.element.body.iterchildren():
+        if child.tag.endswith("}p"):
+            text = Paragraph(child, doc).text.strip()
+            if text:
+                blocks.append(text)
+            continue
+        if child.tag.endswith("}tbl"):
+            table = Table(child, doc)
+            rows = [" | ".join(cell.text.strip() for cell in row.cells) for row in table.rows]
+            rows = [row for row in rows if row.strip(" |")]
+            if rows:
+                blocks.append("Table:\n" + "\n".join(rows))
+    return ["\n".join(blocks[i : i + 30]) for i in range(0, len(blocks), 30)]
+
+
+def chart_text(chart: Any) -> list[str]:
+    parts: list[str] = []
+    if chart.has_title:
+        title = chart.chart_title.text_frame
+        if title and title.text.strip():
+            parts.append(title.text.strip())
+    for series in chart.series:
+        values = [str(value) for value in series.values]
+        categories: list[str] = []
+        try:
+            categories = [str(category.label) for category in chart.plots[0].categories]
+        except (AttributeError, IndexError, TypeError):
+            pass
+        pairs = [
+            f"{category}: {value}"
+            for category, value in zip(categories, values)
+        ]
+        parts.append(f"Chart series {series.name}: " + "; ".join(pairs or values))
+    return [part for part in parts if part.strip()]
 
 
 def extract_pptx_pages(file_path: Path) -> list[str]:
@@ -414,30 +554,55 @@ def extract_pptx_pages(file_path: Path) -> list[str]:
     for slide in presentation.slides:
         parts: list[str] = []
         for shape in slide.shapes:
-            text = getattr(shape, "text", "")
-            if text and text.strip():
-                parts.append(text)
+            if getattr(shape, "has_table", False):
+                rows = [" | ".join(cell.text.strip() for cell in row.cells) for row in shape.table.rows]
+                parts.extend(row for row in rows if row.strip(" |"))
+            else:
+                text = getattr(shape, "text", "")
+                if text and text.strip():
+                    parts.append(text.strip())
+            if getattr(shape, "has_chart", False):
+                parts.extend(chart_text(shape.chart))
+        try:
+            notes = slide.notes_slide.notes_text_frame.text.strip()
+        except (AttributeError, ValueError):
+            notes = ""
+        if notes:
+            parts.append(f"Speaker notes: {notes}")
         slides.append("\n".join(parts))
     return slides
 
 
-def extract_pages(file_path: Path) -> list[str]:
+def extract_document_pages(file_path: Path) -> tuple[list[tuple[int, str]], list[str]]:
     extension = file_path.suffix.lower()
+    warnings: list[str] = []
     if extension == ".pdf":
         pages = extract_pdf_pages(file_path)
+        try:
+            import fitz
+
+            with fitz.open(file_path) as pdf_doc:
+                for page_number, (page, text) in enumerate(zip(pdf_doc, pages), start=1):
+                    if len(normalize_text(text).split()) < 5 and page.get_images(full=True):
+                        warnings.append(f"likely_scanned_or_image_only_page:{page_number}")
+        except ImportError:
+            pass
     elif extension == ".docx":
         pages = extract_docx_pages(file_path)
     elif extension == ".pptx":
         pages = extract_pptx_pages(file_path)
     else:
         raise ValueError(f"Unsupported extension: {extension}")
+    return [
+        (number, normalized)
+        for number, page in enumerate(pages, start=1)
+        if (normalized := normalize_text(page))
+    ], warnings
 
-    normalized_pages: list[str] = []
-    for page in pages:
-        normalized = normalize_text(page)
-        if normalized:
-            normalized_pages.append(normalized)
-    return normalized_pages
+
+def extract_pages(file_path: Path) -> list[str]:
+    pages, _ = extract_document_pages(file_path)
+    return [text for _, text in pages]
 
 
 def trim_tail_sections(pages: list[str], trim_tail_pages: int) -> list[str]:
@@ -519,6 +684,73 @@ def chunk_text(
     return chunks
 
 
+def split_sentences(text: str) -> list[list[str]]:
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
+    return [sentence.split() for sentence in sentences if sentence.split()]
+
+
+def chunk_sections(
+    pages: list[tuple[int, str]],
+    chunk_words: int,
+    overlap_words: int,
+    min_chunk_words: int,
+) -> list[dict[str, Any]]:
+    if overlap_words >= chunk_words:
+        raise ValueError("overlap_words must be smaller than chunk_words")
+    units: list[tuple[int, list[str], int]] = []
+    source_word = 0
+    for page_number, page_text in pages:
+        for sentence in split_sentences(page_text):
+            while sentence:
+                part, sentence = sentence[:chunk_words], sentence[chunk_words:]
+                units.append((page_number, part, source_word))
+                source_word += len(part)
+    chunks: list[dict[str, Any]] = []
+    current: list[tuple[int, list[str], int]] = []
+    for unit in units:
+        current_words = sum(len(words) for _, words, _ in current)
+        if current and current_words + len(unit[1]) > chunk_words:
+            words = [word for _, sentence, _ in current for word in sentence]
+            if len(words) >= min_chunk_words:
+                chunks.append(
+                    {
+                        "text": " ".join(words),
+                        "start_page": current[0][0],
+                        "end_page": current[-1][0],
+                        "source_page_numbers": json.dumps(
+                            list(dict.fromkeys(page for page, _, _ in current))
+                        ),
+                        "source_word_start": current[0][2],
+                        "source_word_end": current[-1][2] + len(current[-1][1]),
+                    }
+                )
+            overlap: list[tuple[int, list[str], int]] = []
+            overlap_count = 0
+            for previous in reversed(current):
+                if overlap_count + len(previous[1]) > overlap_words:
+                    break
+                overlap.insert(0, previous)
+                overlap_count += len(previous[1])
+            current = overlap
+        current.append(unit)
+    if current:
+        words = [word for _, sentence, _ in current for word in sentence]
+        if len(words) >= min_chunk_words:
+            chunks.append(
+                {
+                    "text": " ".join(words),
+                    "start_page": current[0][0],
+                    "end_page": current[-1][0],
+                    "source_page_numbers": json.dumps(
+                        list(dict.fromkeys(page for page, _, _ in current))
+                    ),
+                    "source_word_start": current[0][2],
+                    "source_word_end": current[-1][2] + len(current[-1][1]),
+                }
+            )
+    return chunks
+
+
 def write_jsonl(path: Path, rows: Iterable[dict]) -> None:
     with path.open("w", encoding="utf-8") as output_file:
         for row in rows:
@@ -527,129 +759,140 @@ def write_jsonl(path: Path, rows: Iterable[dict]) -> None:
 
 def process_dataset(args: argparse.Namespace) -> None:
     start_time = perf_counter()
-
+    default_output_dir = Path(__file__).resolve().parent
+    if args.limit is not None and args.output_dir.resolve() == default_output_dir.resolve() and not args.allow_pilot_overwrite:
+        raise RuntimeError("--limit requires --allow-pilot-overwrite when using the default output directory")
     if not args.input_dir.exists():
         raise FileNotFoundError(f"Input directory does not exist: {args.input_dir}")
 
     extensions = normalize_extensions(args.extensions)
     files = discover_files(args.input_dir, extensions)
     selected_files = select_files(files, args.limit, args.sample_mode, args.seed)
-
-    LOGGER.info("Discovered %d files (extensions=%s)", len(files), ",".join(extensions))
-    LOGGER.info("Selected %d files for this run", len(selected_files))
-
     if not selected_files:
-        raise RuntimeError(
-            "No files matched the given input directory and extension filters"
-        )
+        raise RuntimeError("No files matched the given input directory and extension filters")
 
     chroma_chunks: list[dict] = []
     finetune_templates: list[dict] = []
-    failed_files: list[str] = []
+    manifest_rows: list[dict[str, Any]] = []
+    failures: list[str] = []
+    seen_content: dict[str, str] = {}
+    family_simhashes: list[tuple[int, str]] = []
+    family_parents: dict[str, str] = {}
+    if not 0 <= args.near_duplicate_distance <= 64:
+        raise ValueError("--near-duplicate-distance must be between 0 and 64")
 
     for index, file_path in enumerate(selected_files, start=1):
         file_start = perf_counter()
+        relative_source = str(file_path.relative_to(args.input_dir))
         try:
-            pages = extract_pages(file_path)
-            pages = trim_tail_sections(pages, args.trim_tail_pages)
-            text = "\n\n".join(pages)
-            text = strip_vcsc_disclaimers(text)
-            document_metadata = build_document_metadata(file_path, args.input_dir, text)
-            text = strip_head_boilerplate(text)
-            chunks = chunk_text(
-                text=text,
-                chunk_words=args.chunk_words,
-                overlap_words=args.overlap_words,
-                min_chunk_words=args.min_chunk_words,
-            )
-            chunks = [chunk for chunk in chunks if is_quality_chunk(chunk)]
-
-            if not chunks:
-                LOGGER.warning(
-                    "[%d/%d] No valid chunks: %s", index, len(selected_files), file_path
-                )
+            pages, warnings = extract_document_pages(file_path)
+            trimmed_texts = trim_tail_sections([text for _, text in pages], args.trim_tail_pages)
+            pages = pages[: len(trimmed_texts)]
+            cleaned_pages = [
+                (number, strip_vcsc_disclaimers(strip_head_boilerplate(text)))
+                for number, text in pages
+            ]
+            cleaned_pages = [(number, text) for number, text in cleaned_pages if text]
+            text = "\n\n".join(text for _, text in cleaned_pages)
+            metadata = build_document_metadata(file_path, args.input_dir, text, extraction_warnings=warnings)
+            content_hash = metadata["content_sha256"]
+            if not args.keep_duplicates and content_hash in seen_content:
+                manifest_rows.append({
+                    **metadata,
+                    "status": "skipped",
+                    "reason_code": "duplicate_normalized_content",
+                    "duplicate_of": seen_content[content_hash],
+                    "chunk_count": 0,
+                })
                 continue
-
+            seen_content[content_hash] = relative_source
+            simhash = content_simhash(text)
+            if add_near_duplicate_family(
+                simhash,
+                metadata["document_family_id"],
+                family_simhashes,
+                family_parents,
+                args.near_duplicate_distance,
+            ):
+                warnings.append("near_duplicate_revision_grouped")
+                metadata["extraction_warnings"] = json.dumps(warnings, ensure_ascii=False)
+            chunks = chunk_sections(
+                cleaned_pages, args.chunk_words, args.overlap_words, args.min_chunk_words
+            )
+            chunks = [chunk for chunk in chunks if is_quality_chunk(chunk["text"])]
+            if not chunks:
+                manifest_rows.append({
+                    **metadata,
+                    "status": "skipped",
+                    "reason_code": "no_quality_chunks",
+                    "chunk_count": 0,
+                })
+                continue
             for chunk_index, chunk in enumerate(chunks):
-                chunk_id = f"{document_metadata['doc_id']}_chunk_{chunk_index:04d}"
-
-                chroma_chunks.append(
-                    {
-                        "id": chunk_id,
-                        "text": chunk,
-                        "metadata": {
-                            **document_metadata,
-                            "chunk_index": chunk_index,
-                            "chunk_word_count": len(chunk.split()),
-                        },
-                    }
-                )
-
-                finetune_templates.append(
-                    {
-                        "metadata": {
-                            **document_metadata,
-                            "chunk_index": chunk_index,
-                            "chunk_word_count": len(chunk.split()),
-                        },
-                        "messages": [
-                            {"role": "system", "content": SYSTEM_PROMPT},
+                chunk_id = f"{metadata['doc_id']}_chunk_{chunk_index:04d}"
+                chunk_metadata = {
+                    **metadata,
+                    **{key: value for key, value in chunk.items() if key != "text"},
+                    "chunk_index": chunk_index,
+                    "chunk_word_count": len(chunk["text"].split()),
+                }
+                chroma_chunks.append({"id": chunk_id, "text": chunk["text"], "metadata": chunk_metadata})
+                finetune_templates.append({
+                    "metadata": {
+                        **chunk_metadata,
+                        "context_sha256": hashlib.sha256(chunk["text"].encode("utf-8")).hexdigest(),
+                        "task_type": "analytical_synthesis",
+                        "source_spans": [
                             {
-                                "role": "user",
-                                "content": f"Context:\n{chunk}\n\n{USER_TASK_PROMPT}",
-                            },
-                            {
-                                "role": "assistant",
-                                "content": "",
-                            },
+                                "start_page": chunk["start_page"],
+                                "end_page": chunk["end_page"],
+                                "source_word_start": chunk["source_word_start"],
+                                "source_word_end": chunk["source_word_end"],
+                            }
                         ],
-                    }
-                )
-
-            elapsed = perf_counter() - file_start
-            LOGGER.info(
-                "[%d/%d] Parsed %s -> %d chunks in %.2fs",
-                index,
-                len(selected_files),
-                file_path.name,
-                len(chunks),
-                elapsed,
-            )
+                        "review_status": "draft",
+                        "reviewed_by": "",
+                        "reviewed_at": "",
+                        "approval_checklist_version": "v1",
+                        "verified_external_numbers": [],
+                    },
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": f"Context:\n{chunk['text']}\n\n{USER_TASK_PROMPT}"},
+                        {"role": "assistant", "content": ""},
+                    ],
+                })
+            manifest_rows.append({
+                **metadata,
+                "status": "parsed",
+                "reason_code": "ok",
+                "chunk_count": len(chunks),
+                "elapsed_seconds": round(perf_counter() - file_start, 3),
+            })
+            LOGGER.info("[%d/%d] Parsed %s -> %d chunks", index, len(selected_files), file_path.name, len(chunks))
         except Exception as exc:  # noqa: PERF203
-            failed_files.append(str(file_path))
-            LOGGER.error(
-                "[%d/%d] Failed %s: %s", index, len(selected_files), file_path, exc
-            )
+            details = traceback.format_exc()
+            manifest_rows.append({
+                "relative_source": relative_source,
+                "status": "failed",
+                "reason_code": type(exc).__name__,
+                "exception": str(exc),
+                "exception_details": details,
+                "chunk_count": 0,
+            })
+            failures.append(f"{relative_source}\n{details}")
+            LOGGER.error("[%d/%d] Failed %s: %s", index, len(selected_files), file_path.name, exc)
 
+    canonicalize_document_families(chroma_chunks, family_parents)
+    canonicalize_document_families(finetune_templates, family_parents)
+    canonicalize_document_families(manifest_rows, family_parents)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    chroma_path = args.output_dir / "chroma_chunks.jsonl"
-    finetune_path = args.output_dir / "finetune_template.jsonl"
-
-    write_jsonl(chroma_path, chroma_chunks)
-    write_jsonl(finetune_path, finetune_templates)
-
-    elapsed_total = perf_counter() - start_time
-    processed_files = len(selected_files) - len(failed_files)
-    avg_chunks_per_file = (
-        (len(chroma_chunks) / processed_files) if processed_files else 0.0
-    )
-
-    LOGGER.info("Run complete in %.2fs", elapsed_total)
-    LOGGER.info(
-        "Processed files: %d | Failed files: %d", processed_files, len(failed_files)
-    )
-    LOGGER.info(
-        "Total chunks: %d | Avg chunks/file: %.2f",
-        len(chroma_chunks),
-        avg_chunks_per_file,
-    )
-    LOGGER.info("Output: %s", chroma_path)
-    LOGGER.info("Output: %s", finetune_path)
-
-    if failed_files:
-        failed_log = args.output_dir / "parse_failures.log"
-        failed_log.write_text("\n".join(failed_files), encoding="utf-8")
-        LOGGER.warning("Failed file list written to %s", failed_log)
+    write_jsonl(args.output_dir / "chroma_chunks.jsonl", chroma_chunks)
+    write_jsonl(args.output_dir / "finetune_template.jsonl", finetune_templates)
+    write_jsonl(args.output_dir / "parse_manifest.jsonl", manifest_rows)
+    if failures:
+        (args.output_dir / "parse_failures.log").write_text("\n\n".join(failures), encoding="utf-8")
+    LOGGER.info("Run complete in %.2fs | chunks=%d", perf_counter() - start_time, len(chroma_chunks))
 
 
 def main() -> int:

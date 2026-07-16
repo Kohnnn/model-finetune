@@ -1,0 +1,46 @@
+{
+  "pack_id": "synthetic-claim-ledger-template-v1",
+  "cases": [
+    {
+      "id": "synthetic-supported-fact",
+      "question": "What synthetic metric is stated in the placeholder report?",
+      "expected_mode": "model",
+      "language": "en",
+      "task_type": "fact_lookup",
+      "critical": true,
+      "claims": [
+        {
+          "id": "synthetic-metric",
+          "required_terms": ["placeholder metric"],
+          "any_terms": ["increased", "rose"],
+          "numeric_values": [42],
+          "supporting_doc_ids": ["synthetic-report-001"],
+          "prohibited_terms": ["guaranteed"]
+        }
+      ],
+      "frozen_sources": [
+        {
+          "relative_source": "synthetic/placeholder-report.txt",
+          "doc_id": "synthetic-report-001",
+          "excerpt": "The placeholder metric increased to 42 units in this synthetic example."
+        }
+      ]
+    },
+    {
+      "id": "synthetic-unsupported-request",
+      "question": "What is the secret code for the synthetic system?",
+      "expected_mode": "refusal",
+      "language": "en",
+      "task_type": "unsupported",
+      "critical": true,
+      "claims": [],
+      "frozen_sources": [
+        {
+          "relative_source": "synthetic/placeholder-report.txt",
+          "doc_id": "synthetic-report-001",
+          "excerpt": "This synthetic source contains no secret code or credential."
+        }
+      ]
+    }
+  ]
+}

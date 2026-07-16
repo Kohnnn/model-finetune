@@ -29,7 +29,7 @@ services:
   # Use this instead of ollama when deploying a local GGUF file.
   # Set LLM_MODEL to the model file name in /models
   llama-server:
-    image: ghcr.io/ggerganov/llama.cpp:server
+    image: ${LLAMA_CPP_IMAGE:-ghcr.io/ggerganov/llama.cpp:server}
     container_name: llama_server
     command:
       - --model
@@ -43,15 +43,15 @@ services:
       - --port
       - "8080"
       - --ctx-size
-      - "8192"
+      - ${LLAMA_CTX_SIZE:-8192}
       - --n-gpu-layers
-      - "32"
+      - ${LLAMA_N_GPU_LAYERS:-32}
       - --threads
-      - "4"
+      - ${LLAMA_THREADS:-4}
     volumes:
       - ./models:/models:ro
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     deploy:
       resources:
         limits:
@@ -93,7 +93,7 @@ services:
     container_name: custom_app
     command: uvicorn main:app --host 0.0.0.0 --port 8000
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       - APP_HOST=0.0.0.0
       - APP_PORT=8000
@@ -101,8 +101,19 @@ services:
       - LLAMA_API_URL=${LLAMA_API_URL:-http://llama-server:8080/v1}
       - CHROMA_API_URL=http://chromadb:8000
       - CHROMA_AUTH_TOKEN=${CHROMA_AUTH_TOKEN:-change-me}
+      - EVALUATION_API_TOKEN=${EVALUATION_API_TOKEN:-}
+      - EVALUATION_ATTESTATION_KEY=${EVALUATION_ATTESTATION_KEY:-}
+      - EVALUATION_MODEL_PATH=/models/${LLM_MODEL:-Qwen3.5-4B.Clean-Recovery.Q4_K_M.gguf}
+      - EVALUATION_MMPROJ_PATH=/models/${LLAMA_MMPROJ_FILENAME:-Qwen3.5-4B.BF16-mmproj.gguf}
+      - EVALUATION_INDEX_PATH=/data/ocr_pipeline/chroma_chunks.jsonl
+      - EVALUATION_CHECKSUMS_PATH=/models/SHA256SUMS
+      - INGESTION_LOCK_PATH=/run/private-analyst-locks/ingest.lock
       - CHROMA_COLLECTION_NAME=${CHROMA_COLLECTION_NAME:-research_chunks_v1}
       - EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME:-sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2}
+      - LLAMA_CPP_IMAGE=${LLAMA_CPP_IMAGE:-ghcr.io/ggerganov/llama.cpp:server}
+      - LLAMA_CTX_SIZE=${LLAMA_CTX_SIZE:-8192}
+      - LLAMA_N_GPU_LAYERS=${LLAMA_N_GPU_LAYERS:-32}
+      - LLAMA_THREADS=${LLAMA_THREADS:-4}
       # The Ollama model name — used only when LLAMA_API_URL points to Ollama
       - LLM_MODEL_NAME=${LLM_MODEL_NAME:-qwen3.5-private-analyst}
       - RETRIEVAL_TOP_K=${RETRIEVAL_TOP_K:-4}
@@ -112,7 +123,9 @@ services:
       - LLM_TIMEOUT_SECONDS=${LLM_TIMEOUT_SECONDS:-120}
     volumes:
       - ../ocr_pipeline:/data/ocr_pipeline:ro
+      - ./models:/models:ro
       - ./model_cache:/root/.cache
+      - ingestion_locks:/run/private-analyst-locks:ro
     depends_on:
       chromadb:
         condition: service_healthy
@@ -138,9 +151,11 @@ services:
       - CHROMA_AUTH_TOKEN=${CHROMA_AUTH_TOKEN:-change-me}
       - CHROMA_COLLECTION_NAME=${CHROMA_COLLECTION_NAME:-research_chunks_v1}
       - EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME:-sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2}
+      - INGESTION_LOCK_PATH=/run/private-analyst-locks/ingest.lock
     volumes:
       - ../ocr_pipeline:/data/ocr_pipeline:ro
       - ./model_cache:/root/.cache
+      - ingestion_locks:/run/private-analyst-locks
     depends_on:
       - chromadb
     networks:
@@ -173,3 +188,4 @@ networks:
 
 volumes:
   ollama_data:
+  ingestion_locks:

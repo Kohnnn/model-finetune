@@ -270,7 +270,9 @@ def infer_visual_kind(caption: str) -> str:
         return "composition chart or breakdown figure"
     if any(term in lowered for term in ["trend", "growth", "cagr", "over time", "since"]):
         return "trend chart"
-    if any(term in lowered for term in ["forecast", "estimate", "f", "projection"]):
+    if any(term in lowered for term in ["forecast", "estimate", "projection"]) or re.search(
+        r"\b(?:19|20)\d{2}f\b", lowered
+    ):
         return "forecast chart/table"
     if any(term in lowered for term in ["correlation", "vs", "versus"]):
         return "comparison chart"

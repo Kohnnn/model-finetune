@@ -4,10 +4,11 @@ This folder contains the local document parsing and chunk generation pipeline.
 
 ## Purpose
 
-`process_pdfs.py` scans research files, extracts text, removes common tail boilerplate, drops most disclaimer/contact sections, chunks documents, and writes two JSONL outputs:
+`process_pdfs.py` scans research files, extracts text and supported tables/charts/notes, removes confidently detected boilerplate, groups exact copies and minor revisions, creates sentence-aware chunks with source spans, and writes three JSONL outputs:
 
 - `chroma_chunks.jsonl` for retrieval
 - `finetune_template.jsonl` for later supervised fine-tuning
+- `parse_manifest.jsonl` with parsed/skipped/failed status and reason codes
 
 Despite the folder name, the current implementation is primarily text extraction rather than image OCR.
 
@@ -86,49 +87,40 @@ python ocr_pipeline/process_pdfs.py --help
 
 Key arguments:
 
-- `--limit` for pilot runs
+- `--limit` for pilot runs; use a separate `--output-dir` unless intentionally passing `--allow-pilot-overwrite`
 - `--sample-mode` and `--seed` for deterministic sampling
 - `--chunk-words`, `--overlap-words`, `--min-chunk-words`
-- `--trim-tail-pages` for extra tail trimming after the boilerplate detector runs
+- `--trim-tail-pages` for explicit extra trimming; the safe default is `0`
+- `--near-duplicate-distance` for grouping minor revisions into one split family
+- `--keep-duplicates` only when exact duplicate documents are intentionally needed
 
 ## Output Schema
 
 ### `chroma_chunks.jsonl`
 
-Each row contains:
+Each row contains `id`, `text`, and metadata including:
 
-- `id`
-- `text`
-- `metadata.source`
-- `metadata.relative_source`
-- `metadata.doc_id`
-- `metadata.title`
-- `metadata.year`
-- `metadata.language`
-- `metadata.file_extension`
-- `metadata.chunk_index`
-- `metadata.chunk_word_count`
+- `relative_source`, `doc_id`, `document_family_id`
+- `source_file_sha256`, `content_sha256`, `parser_schema_version`
+- `title`, `year`, `language`, `file_extension`
+- `chunk_index`, `chunk_word_count`
+- `start_page`, `end_page`, `source_page_numbers`
+- `source_word_start`, `source_word_end`
+- `extraction_method`, `extraction_warnings`
+
+Absolute local source paths are not emitted.
 
 ### `finetune_template.jsonl`
 
-Each row contains chat-format messages plus chunk metadata:
+Each row contains chat-format messages, chunk provenance, `context_sha256`, `source_spans`, a task type, and empty reviewer fields. Every parser row starts with `metadata.review_status="draft"` and an empty assistant placeholder.
 
-- `metadata.source`
-- `metadata.relative_source`
-- `metadata.doc_id`
-- `metadata.title`
-- `metadata.chunk_index`
-- `metadata.chunk_word_count`
-- `system`
-- `user`
-- `assistant` placeholder
-
-You must fill the assistant completions before running meaningful SFT.
+Fill an original assistant completion, verify every claim and number against the source span, complete `reviewed_by` and timezone-aware `reviewed_at`, then set `review_status="approved"`. Run `finetune/audit_dataset.py`; training rejects any approved dataset with audit errors.
 
 ## Current Caveats
 
-- scanned or image-only PDFs are not yet OCRed
-- disclaimer stripping is heuristic, not perfect
+- scanned or image-only PDFs are flagged in `extraction_warnings` but are not OCRed
+- PDF reading order and chart interpretation remain heuristic
+- exact duplicate removal and strict SimHash grouping do not catch every revision
 - some very small documents may produce no retained chunks
 
 ## Failure Handling

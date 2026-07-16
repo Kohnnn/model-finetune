@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import random
@@ -10,10 +11,14 @@ from pathlib import Path
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_TASK_PROMPT = (
-    "Task: Deliver expert equity research commentary and strategic evaluation based "
-    "on the context above. Prioritize deep analysis over factual reporting."
-)
+TASK_PROMPTS = {
+    "earnings_analysis": "Task: Explain the main earnings drivers, separating reported evidence from interpretation.",
+    "risk_analysis": "Task: Identify the material downside risks, their transmission channels, and any evidence limitations.",
+    "valuation_analysis": "Task: Explain the valuation or recommendation rationale without adding unsupported assumptions.",
+    "comparative_analysis": "Task: Compare the entities or periods in the evidence and state the most decision-relevant difference.",
+    "analytical_synthesis": "Task: State the investment thesis, key supporting evidence, and the most important uncertainty.",
+}
+DEFAULT_TASK_PROMPT = TASK_PROMPTS["analytical_synthesis"]
 
 DISCLAIMER_MARKERS = [
     "analyst certification",
@@ -141,6 +146,19 @@ def extract_context(user_content: str) -> str:
     return normalize_text(context)
 
 
+def infer_task_type(context: str) -> str:
+    lowered = context.casefold()
+    if any(term in lowered for term in ["target price", "valuation", "upside", "downside", "giá mục tiêu", "định giá"]):
+        return "valuation_analysis"
+    if any(term in lowered for term in ["risk", "npl", "credit quality", "rủi ro", "nợ xấu"]):
+        return "risk_analysis"
+    if any(term in lowered for term in ["versus", " vs ", "compare", "so với"]):
+        return "comparative_analysis"
+    if any(term in lowered for term in ["earnings", "profit", "margin", "lợi nhuận", "biên lợi nhuận"]):
+        return "earnings_analysis"
+    return "analytical_synthesis"
+
+
 def extract_task_prompt(user_content: str) -> str:
     if "Task:" not in user_content:
         return DEFAULT_TASK_PROMPT
@@ -254,6 +272,8 @@ def iter_seed_rows(input_path: Path, min_chars: int, max_context_words: int):
                 continue
 
             truncated_context = truncate_context_words(context, max_context_words)
+            task_type = infer_task_type(truncated_context)
+            task_prompt = TASK_PROMPTS[task_type]
 
             assistant = build_assistant_completion(
                 truncated_context,
@@ -286,7 +306,13 @@ def iter_seed_rows(input_path: Path, min_chars: int, max_context_words: int):
                     "source_context_word_count": len(context.split()),
                     "truncated_context_word_count": len(truncated_context.split()),
                     "draft_method": "heuristic_extract",
+                    "context_sha256": hashlib.sha256(truncated_context.encode("utf-8")).hexdigest(),
+                    "task_type": task_type,
                     "review_status": "draft",
+                    "reviewed_by": "",
+                    "reviewed_at": "",
+                    "approval_checklist_version": "v1",
+                    "verified_external_numbers": [],
                 },
             }
 

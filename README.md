@@ -196,7 +196,7 @@ python deployment/evaluate_live_query.py --output-path deployment/benchmarks/lat
 
 ## Fine-Tuning Workflow
 
-The release path accepts only human-reviewed rows with `metadata.review_status=approved` and `metadata.doc_id`. It uses a document-level evaluation split, bf16 LoRA, assistant-only loss, baseline/final evaluation, manifests, hashes, and enforced release gates.
+The release path accepts only audited, human-reviewed rows with `metadata.review_status=approved`, source hashes/spans, and `metadata.document_family_id`. It splits exact copies and grouped revisions by document family, verifies full targets fit without truncation, uses bf16 LoRA with assistant-only loss, and records baseline/final evaluation, manifests, hashes, and enforced release gates.
 
 ```powershell
 ./finetune/setup_gpu_env.ps1
@@ -209,10 +209,12 @@ Continue with the exact smoke, training, evaluation, export, validation, publica
 
 - rerun parse and review `ocr_pipeline/parse_failures.log`
 - regenerate the SFT dataset
-- human-review rows and mark only accepted examples `approved`
-- validate the document split, assistant-only loss, baseline, and final metrics in `run_manifest.json`
+- human-review rows, complete provenance/reviewer fields, and mark only accepted examples `approved`
+- run `finetune/audit_dataset.py` and require zero errors
+- validate the document-family split, assistant-only loss, baseline, and final metrics in `run_manifest.json`
+- run the private frozen-context, retrieval, and live claim-ledger comparison
 - export merged HF, GGUF, matching mmproj, and SHA-256 artifacts
-- compare baseline and candidate with `deployment/evaluate_live_query.py`
+- run `deployment/evaluate_live_query.py` as the fixed five-case release smoke
 - pass `finetune/validate_release.py`
 - copy both GGUF files and `SHA256SUMS` into `deployment/models/`
 - run `python deployment/bootstrap_local.py --ingest-limit 1024`

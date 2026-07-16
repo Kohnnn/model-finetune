@@ -15,6 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    from .audit_dataset import audit_dataset, audit_summary
+except ImportError:
+    from audit_dataset import audit_dataset, audit_summary
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -257,12 +262,20 @@ def _review_status(row: dict[str, Any]) -> str | None:
     return str(status).strip() if status is not None else None
 
 
-def _document_id(row: dict[str, Any]) -> str | None:
+def _metadata_id(row: dict[str, Any], name: str) -> str | None:
     metadata = row.get("metadata")
     if not isinstance(metadata, dict):
         return None
-    doc_id = metadata.get("doc_id")
-    return str(doc_id).strip() if doc_id is not None else None
+    value = metadata.get(name)
+    return str(value).strip() if value is not None and str(value).strip() else None
+
+
+def _document_id(row: dict[str, Any]) -> str | None:
+    return _metadata_id(row, "doc_id")
+
+
+def _document_family_id(row: dict[str, Any]) -> str | None:
+    return _metadata_id(row, "document_family_id")
 
 
 def _has_nonempty_assistant(messages: Any) -> bool:
@@ -298,6 +311,27 @@ def _is_valid_messages_list(messages: Any) -> bool:
     return "user" in roles and "assistant" in roles
 
 
+def select_complete_families(dataset, max_samples: int, seed: int):
+    family_indices: dict[str, list[int]] = {}
+    for index, row in enumerate(dataset):
+        family_id = _document_family_id(row)
+        if family_id is None:
+            raise RuntimeError("Approved rows require metadata.document_family_id for family-aware sampling.")
+        family_indices.setdefault(family_id, []).append(index)
+    family_ids = sorted(family_indices)
+    random.Random(seed).shuffle(family_ids)
+    family_ids.sort(key=lambda family_id: len(family_indices[family_id]), reverse=True)
+    selected: list[int] = []
+    for family_id in family_ids:
+        indices = family_indices[family_id]
+        if len(selected) + len(indices) <= max_samples:
+            selected.extend(indices)
+    if not selected:
+        smallest_family = min(family_ids, key=lambda family_id: (len(family_indices[family_id]), family_id))
+        selected = family_indices[smallest_family]
+    return dataset.select(sorted(selected))
+
+
 def load_and_validate_dataset(
     dataset_path: Path,
     max_samples: int | None,
@@ -305,12 +339,19 @@ def load_and_validate_dataset(
     allow_empty_assistant: bool,
     required_review_status: str = "approved",
 ):
-    from datasets import load_dataset
-
     if not dataset_path.exists():
         raise FileNotFoundError(
             f"Dataset not found: {dataset_path}. Run ocr_pipeline/process_pdfs.py first."
         )
+    audit_report = None
+    if required_review_status:
+        audit_report = audit_dataset(dataset_path)
+        if audit_report["error_count"]:
+            raise RuntimeError(
+                "Approved dataset audit failed: "
+                f"errors={audit_report['error_count']}, warnings={audit_report['warning_count']}."
+            )
+    from datasets import load_dataset
 
     dataset = load_dataset("json", data_files=str(dataset_path), split="train")
     total_rows = len(dataset)
@@ -373,18 +414,26 @@ def load_and_validate_dataset(
             )
 
     missing_doc_ids = sum(_document_id(row) is None for row in dataset)
-    if missing_doc_ids:
+    missing_family_ids = sum(_document_family_id(row) is None for row in dataset)
+    if required_review_status and (missing_doc_ids or missing_family_ids):
         raise RuntimeError(
-            f"{missing_doc_ids} rows are missing metadata.doc_id; document-level splitting is required."
+            "Approved rows require metadata.doc_id and metadata.document_family_id; "
+            f"missing_doc_ids={missing_doc_ids}, missing_family_ids={missing_family_ids}."
         )
 
     eligible_rows = len(dataset)
-    sample_limit_applied = max_samples is not None and eligible_rows > max(1, max_samples)
+    sample_limit_applied = max_samples is not None and eligible_rows > max_samples
     if sample_limit_applied:
-        dataset = dataset.shuffle(seed=seed).select(range(max(1, max_samples)))
-        LOGGER.info("Dataset limited to %d rows (--max-samples).", len(dataset))
+        if max_samples is None or max_samples < 1:
+            raise ValueError("--max-samples must be positive.")
+        if required_review_status:
+            dataset = select_complete_families(dataset, max_samples, seed)
+            LOGGER.info("Dataset limited to %d complete-family rows (--max-samples).", len(dataset))
+        else:
+            dataset = dataset.shuffle(seed=seed).select(range(max_samples))
+            LOGGER.info("Parser dry-run dataset limited to %d rows (--max-samples).", len(dataset))
 
-    return dataset, eligible_rows, sample_limit_applied
+    return dataset, eligible_rows, sample_limit_applied, audit_summary(audit_report) if audit_report else None
 
 
 def load_training_stack() -> dict[str, Any]:
@@ -394,7 +443,7 @@ def load_training_stack() -> dict[str, Any]:
         from transformers import AutoConfig
         from transformers import Trainer
         from transformers import TrainingArguments
-        from transformers import default_data_collator
+        from transformers import DataCollatorForTokenClassification
     except ImportError as exc:
         raise RuntimeError(
             "Missing training dependencies. Install with: pip install -r finetune/requirements.txt"
@@ -403,7 +452,7 @@ def load_training_stack() -> dict[str, Any]:
     return {
         "torch": torch,
         "AutoConfig": AutoConfig,
-        "default_data_collator": default_data_collator,
+        "DataCollatorForTokenClassification": DataCollatorForTokenClassification,
         "Trainer": Trainer,
         "TrainingArguments": TrainingArguments,
         "FastLanguageModel": FastLanguageModel,
@@ -462,18 +511,26 @@ def format_chat_examples(dataset, tokenizer, allow_thinking_template: bool):
     )
 
 
+def verify_formatted_examples_fit(dataset, tokenizer, max_seq_length: int) -> None:
+    for index, row in enumerate(dataset):
+        tokenized = tokenizer(row["text"], truncation=False, add_special_tokens=False)
+        if len(tokenized["input_ids"]) > max_seq_length:
+            raise RuntimeError(
+                f"Rendered conversation at dataset index {index} exceeds --max-seq-length={max_seq_length}; refusing truncation."
+            )
+
+
 def tokenize_formatted_examples(dataset, tokenizer, max_seq_length: int):
+    verify_formatted_examples_fit(dataset, tokenizer, max_seq_length)
+
     def tokenize_batch(examples: dict[str, list[str]]) -> dict[str, list[list[int]]]:
         tokens = tokenizer(
             text=examples["text"],
-            truncation=True,
-            max_length=max_seq_length,
-            padding="max_length",
+            truncation=False,
+            padding=False,
+            add_special_tokens=False,
         )
-        tokens["labels"] = [
-            [token_id if mask else -100 for token_id, mask in zip(ids, masks)]
-            for ids, masks in zip(tokens["input_ids"], tokens["attention_mask"])
-        ]
+        tokens["labels"] = [list(ids) for ids in tokens["input_ids"]]
         return tokens
 
     return dataset.map(
@@ -501,41 +558,49 @@ def choose_eval_document_ids(
     return set(unique_ids[:eval_count])
 
 
+def dataset_metadata_ids(dataset, name: str) -> set[str]:
+    return {value for row in dataset if (value := _metadata_id(row, name)) is not None}
+
+
 def dataset_document_ids(dataset) -> set[str]:
-    return {
-        doc_id
-        for row in dataset
-        if (doc_id := _document_id(row)) is not None
-    }
+    return dataset_metadata_ids(dataset, "doc_id")
+
+
+def dataset_family_ids(dataset) -> set[str]:
+    return dataset_metadata_ids(dataset, "document_family_id")
+
+
+def choose_eval_family_ids(family_ids: list[str], eval_split: float, seed: int) -> set[str]:
+    return choose_eval_document_ids(family_ids, eval_split, seed)
 
 
 def split_dataset(dataset, eval_split: float, seed: int):
     if eval_split <= 0:
         return dataset, None
 
-    eval_doc_ids = choose_eval_document_ids(
-        [_document_id(row) for row in dataset if _document_id(row) is not None],
+    eval_family_ids = choose_eval_family_ids(
+        [_document_family_id(row) for row in dataset if _document_family_id(row) is not None],
         eval_split,
         seed,
     )
     train_set = dataset.filter(
-        lambda row: _document_id(row) not in eval_doc_ids,
-        desc="Selecting training documents",
+        lambda row: _document_family_id(row) not in eval_family_ids,
+        desc="Selecting training document families",
     )
     eval_set = dataset.filter(
-        lambda row: _document_id(row) in eval_doc_ids,
-        desc="Selecting evaluation documents",
+        lambda row: _document_family_id(row) in eval_family_ids,
+        desc="Selecting evaluation document families",
     )
-    train_docs = dataset_document_ids(train_set)
-    eval_docs = dataset_document_ids(eval_set)
-    if train_docs & eval_docs:
-        raise RuntimeError("Document-level split leaked source documents across train and eval.")
+    train_families = dataset_family_ids(train_set)
+    eval_families = dataset_family_ids(eval_set)
+    if not train_families or not eval_families or train_families & eval_families:
+        raise RuntimeError("Document-family split leaked or omitted document families across train and eval.")
     LOGGER.info(
-        "Document split -> train=%d rows/%d docs, eval=%d rows/%d docs",
+        "Document-family split -> train=%d rows/%d families, eval=%d rows/%d families",
         len(train_set),
-        len(train_docs),
+        len(train_families),
         len(eval_set),
-        len(eval_docs),
+        len(eval_families),
     )
     return train_set, eval_set
 
@@ -753,6 +818,9 @@ def write_training_summary(
     eval_rows: int,
     train_document_ids: set[str],
     eval_document_ids: set[str],
+    train_family_ids: set[str],
+    eval_family_ids: set[str],
+    audit_report: dict[str, Any] | None,
     metrics: dict[str, Any],
     eligible_rows: int,
     sample_limit_applied: bool,
@@ -775,13 +843,18 @@ def write_training_summary(
         "required_review_status": "approved",
         "output_dir": str(output_dir),
         "seed": args.seed,
-        "split_strategy": "document_id",
+        "split_strategy": "document_family_id",
         "train_rows": train_rows,
         "eval_rows": eval_rows,
         "train_document_count": len(train_document_ids),
         "eval_document_count": len(eval_document_ids),
         "train_document_ids": sorted(train_document_ids),
         "eval_document_ids": sorted(eval_document_ids),
+        "train_family_count": len(train_family_ids),
+        "eval_family_count": len(eval_family_ids),
+        "train_family_ids": sorted(train_family_ids),
+        "eval_family_ids": sorted(eval_family_ids),
+        "audit": audit_report,
         "max_seq_length": args.max_seq_length,
         "batch_size": args.batch_size,
         "gradient_accumulation": args.gradient_accumulation,
@@ -817,6 +890,8 @@ def run_training(args: argparse.Namespace) -> int:
         raise RuntimeError(
             "Production training requires --skip-gguf-export; run export_gguf.py from the saved merged model."
         )
+    if not args.dry_run and not args.save_merged_model:
+        raise RuntimeError("Production training requires --save-merged-model for release provenance.")
     training_git_commit = current_git_commit() if not args.dry_run else None
     training_git_dirty = (
         current_git_dirty(args.output_dir) if not args.dry_run else None
@@ -828,7 +903,7 @@ def run_training(args: argparse.Namespace) -> int:
     required_review_status = "" if args.allow_empty_assistant else "approved"
     dataset_sha256 = sha256_file(args.dataset_path)
 
-    dataset, eligible_rows, sample_limit_applied = load_and_validate_dataset(
+    dataset, eligible_rows, sample_limit_applied, audit_report = load_and_validate_dataset(
         dataset_path=args.dataset_path,
         max_samples=args.max_samples,
         seed=args.seed,
@@ -845,9 +920,9 @@ def run_training(args: argparse.Namespace) -> int:
     else:
         train_dataset, eval_dataset = split_dataset(dataset, args.eval_split, args.seed)
     train_document_ids = dataset_document_ids(train_dataset)
-    eval_document_ids = (
-        dataset_document_ids(eval_dataset) if eval_dataset is not None else set()
-    )
+    eval_document_ids = dataset_document_ids(eval_dataset) if eval_dataset is not None else set()
+    train_family_ids = dataset_family_ids(train_dataset)
+    eval_family_ids = dataset_family_ids(eval_dataset) if eval_dataset is not None else set()
 
     if args.dry_run:
         LOGGER.info("Dry run complete. Skipping model initialization and training.")
@@ -857,7 +932,7 @@ def run_training(args: argparse.Namespace) -> int:
     stack = load_training_stack()
     torch = stack["torch"]
     AutoConfig = stack["AutoConfig"]
-    default_data_collator = stack["default_data_collator"]
+    DataCollatorForTokenClassification = stack["DataCollatorForTokenClassification"]
     Trainer = stack["Trainer"]
     TrainingArguments = stack["TrainingArguments"]
     FastLanguageModel = stack["FastLanguageModel"]
@@ -1001,7 +1076,10 @@ def run_training(args: argparse.Namespace) -> int:
         "model": model,
         "train_dataset": train_dataset,
         "eval_dataset": eval_dataset,
-        "data_collator": default_data_collator,
+        "data_collator": DataCollatorForTokenClassification(
+            training_tokenizer,
+            label_pad_token_id=-100,
+        ),
         "args": training_args,
     }
     trainer_signature = inspect.signature(Trainer.__init__)
@@ -1046,6 +1124,9 @@ def run_training(args: argparse.Namespace) -> int:
         eval_rows=len(eval_dataset) if eval_dataset is not None else 0,
         train_document_ids=train_document_ids,
         eval_document_ids=eval_document_ids,
+        train_family_ids=train_family_ids,
+        eval_family_ids=eval_family_ids,
+        audit_report=audit_report,
         metrics=metrics,
         eligible_rows=eligible_rows,
         sample_limit_applied=sample_limit_applied,

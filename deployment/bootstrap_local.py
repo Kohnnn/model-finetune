@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -115,6 +116,31 @@ def validate_inputs(env_values: dict[str, str], with_proxy: bool, inference: str
         chroma_token not in {"", "change-me", "replace-with-a-long-random-token"},
         "Set CHROMA_AUTH_TOKEN in deployment/.env to a real secret value.",
     )
+    evaluation_token = env_values.get("EVALUATION_API_TOKEN", "")
+    attestation_key = env_values.get("EVALUATION_ATTESTATION_KEY", "")
+    require(
+        bool(evaluation_token) == bool(attestation_key),
+        "Set both EVALUATION_API_TOKEN and EVALUATION_ATTESTATION_KEY, or leave both empty.",
+    )
+    if evaluation_token:
+        require(
+            len(evaluation_token) >= 32
+            and len(attestation_key) >= 32
+            and evaluation_token != attestation_key,
+            "Evaluation secrets must be distinct and at least 32 characters.",
+        )
+        require(
+            inference == "localgguf",
+            "Release evaluation requires the checksum-verified localgguf backend.",
+        )
+        require(
+            re.fullmatch(
+                r"[^\s]+@sha256:[0-9a-f]{64}",
+                env_values.get("LLAMA_CPP_IMAGE", ""),
+            )
+            is not None,
+            "Release evaluation requires LLAMA_CPP_IMAGE pinned by sha256 digest.",
+        )
 
     if inference == "localgguf":
         # docker-compose 'llama-server' reads MODEL=/models/${LLM_MODEL:-...};
@@ -166,7 +192,24 @@ def validate_inputs(env_values: dict[str, str], with_proxy: bool, inference: str
         )
 
 
-def run_compose(*args: str, extra_env: dict[str, str] | None = None) -> None:
+def compose_environment(
+    env_values: dict[str, str],
+    extra_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    env = dict(os.environ)
+    compose_text = COMPOSE_FILE.read_text(encoding="utf-8")
+    for key in set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)", compose_text)):
+        env.pop(key, None)
+    env.update(env_values)
+    env.update(extra_env or {})
+    return env
+
+
+def run_compose(
+    *args: str,
+    env_values: dict[str, str],
+    extra_env: dict[str, str] | None = None,
+) -> None:
     command = [
         "docker",
         "compose",
@@ -176,20 +219,25 @@ def run_compose(*args: str, extra_env: dict[str, str] | None = None) -> None:
         str(ENV_PATH),
         *args,
     ]
-    env = None
-    if extra_env:
-        env = {**os.environ, **extra_env}
-    subprocess.run(command, cwd=REPO_ROOT, check=True, env=env)
+    subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        check=True,
+        env=compose_environment(env_values, extra_env),
+    )
 
 
 def run_compose_with_retries(
-    *args: str, retries: int = 5, delay_seconds: int = 5
+    *args: str,
+    env_values: dict[str, str],
+    retries: int = 5,
+    delay_seconds: int = 5,
 ) -> None:
     last_error: subprocess.CalledProcessError | None = None
 
     for attempt in range(1, retries + 1):
         try:
-            run_compose(*args)
+            run_compose(*args, env_values=env_values)
             return
         except subprocess.CalledProcessError as exc:
             last_error = exc
@@ -202,7 +250,10 @@ def run_compose_with_retries(
 
 
 def verify_ollama_model(
-    model_name: str, retries: int = 12, delay_seconds: int = 5
+    model_name: str,
+    env_values: dict[str, str],
+    retries: int = 12,
+    delay_seconds: int = 5,
 ) -> None:
     command = [
         "docker",
@@ -223,7 +274,12 @@ def verify_ollama_model(
     last_error: subprocess.CalledProcessError | None = None
     for attempt in range(retries):
         try:
-            subprocess.run(command, cwd=REPO_ROOT, check=True)
+            subprocess.run(
+                command,
+                cwd=REPO_ROOT,
+                check=True,
+                env=compose_environment(env_values),
+            )
             return
         except subprocess.CalledProcessError as exc:
             last_error = exc
@@ -267,10 +323,17 @@ def main() -> int:
         # The inference services are profile-gated in docker-compose.yml:
         #   localgguf -> llama-server   |   ollama -> ollama
         inference_service = "llama-server" if args.inference == "localgguf" else "ollama"
-        run_compose("up", "-d", "chromadb")
-        run_compose("--profile", args.inference, "up", "-d", inference_service)
+        run_compose("up", "-d", "chromadb", env_values=env_values)
+        run_compose(
+            "--profile",
+            args.inference,
+            "up",
+            "-d",
+            inference_service,
+            env_values=env_values,
+        )
         if args.inference == "ollama":
-            verify_ollama_model(env_values["OLLAMA_MODEL"])
+            verify_ollama_model(env_values["OLLAMA_MODEL"], env_values)
 
         if not args.skip_ingest:
             ingest_command = [
@@ -291,6 +354,7 @@ def main() -> int:
 
             run_compose_with_retries(
                 *ingest_command,
+                env_values=env_values,
                 retries=6,
                 delay_seconds=5,
             )
@@ -307,11 +371,24 @@ def main() -> int:
                 else env_values["OLLAMA_MODEL"]
             ),
         }
-        run_compose("up", "-d", "app", extra_env=app_env)
+        run_compose(
+            "up",
+            "-d",
+            "app",
+            env_values=env_values,
+            extra_env=app_env,
+        )
         wait_for_health(args.health_timeout_seconds)
 
         if args.with_proxy:
-            run_compose("--profile", "proxy", "up", "-d", "nginx")
+            run_compose(
+                "--profile",
+                "proxy",
+                "up",
+                "-d",
+                "nginx",
+                env_values=env_values,
+            )
 
         print("RAG MVP stack is ready.")
         print("Health: http://localhost:8000/healthz")
